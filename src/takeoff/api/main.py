@@ -1,9 +1,14 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from takeoff.api.routes import drawings, takeoff
+
+_STATIC_DIR = Path(__file__).parent / "static"
 
 
 @asynccontextmanager
@@ -30,7 +35,15 @@ app.add_middleware(
 app.include_router(drawings.router, prefix="/drawings", tags=["drawings"])
 app.include_router(takeoff.router, prefix="/takeoff", tags=["takeoff"])
 
+app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/", include_in_schema=False)
+def upload_ui():
+    """Serve the drag-and-drop PDF upload page."""
+    return FileResponse(_STATIC_DIR / "index.html")
