@@ -18,10 +18,12 @@ Formula (length):
 from __future__ import annotations
 
 import math
+import uuid
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
-from takeoff.models.drawing import Drawing
+from takeoff.models.drawing import Drawing, View
+from takeoff.models.material import MaterialInstance
 from takeoff.models.quantity import Quantity
 
 
@@ -34,13 +36,62 @@ class QuantityExtractor:
         For each MaterialInstance in the drawing, compute its quantity
         and persist a Quantity record.
         """
-        raise NotImplementedError(
-            "Phase 9 not yet implemented. "
-            "Load MaterialInstances, get scale_ratio from parent View, "
-            "compute polyline_length() from instance.geometry, "
-            "apply: value = polyline_length * scale_ratio / 12  (PDF pts → LF), "
-            "set confidence from per-stage breakdown, persist Quantity."
+        # Query all MaterialInstances for the drawing's views
+        instances = (
+            self.db.query(MaterialInstance)
+            .join(View)
+            .filter(View.drawing_id == drawing.drawing_id)
+            .options(joinedload(MaterialInstance.quantity), joinedload(MaterialInstance.view))
+            .all()
         )
+        
+        quantities = []
+        for instance in instances:
+            if instance.quantity is not None:
+                # Already has quantity
+                continue
+            
+            view = instance.view  # Assuming loaded via join
+            scale_ratio = view.scale_ratio
+            scale_confidence = view.scale_confidence or 0.0
+            
+            if scale_ratio is None or scale_confidence < 0.5:
+                # Scale uncertain, mark low confidence
+                confidence = 0.1
+                value = None
+                needs_review = True
+            else:
+                # Compute quantity
+                length_pts = self.polyline_length(instance.geometry)
+                value = length_pts * scale_ratio / 12  # LF
+                confidence = scale_confidence  # For now, just scale
+                needs_review = False
+            
+            # For MVP, assume length
+            measurement_type = "length"
+            unit = "LF"
+            
+            confidence_breakdown = {
+                "scale": scale_confidence,
+                "quantity": 1.0 if not needs_review else 0.1
+            }
+            
+            quantity = Quantity(
+                quantity_id=str(uuid.uuid4()),
+                instance_id=instance.instance_id,
+                measurement_type=measurement_type,
+                value=value,
+                unit=unit,
+                confidence=confidence,
+                needs_review=needs_review,
+                confidence_breakdown=confidence_breakdown
+            )
+            
+            self.db.add(quantity)
+            quantities.append(quantity)
+        
+        self.db.commit()
+        return quantities
 
     @staticmethod
     def polyline_length(geometry: dict) -> float:
