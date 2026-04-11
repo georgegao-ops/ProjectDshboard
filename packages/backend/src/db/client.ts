@@ -1,18 +1,21 @@
-import { drizzle } from 'drizzle-orm/node-postgres';
-import { Pool } from 'pg';
+import { drizzle } from 'drizzle-orm/postgres-js';
+import postgres from 'postgres';
 import * as schema from './schema';
 
-// Create connection pool
-const pool = new Pool({
-  host: process.env.DB_HOST || 'localhost',
-  port: parseInt(process.env.DB_PORT || '5432'),
-  user: process.env.DB_USER || 'contractor',
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME || 'contractor_db',
+const connectionString = process.env.DATABASE_URL;
+
+if (!connectionString) {
+  throw new Error('DATABASE_URL environment variable is not set');
+}
+
+const client = postgres(connectionString, {
+  prepare: false,
 });
 
-// Create drizzle client
-export const db = drizzle(pool, { schema });
+export const db = drizzle(client, { schema });
 
-// Export for migrations and direct queries
-export { pool, schema };
+export async function closeDb() {
+  await client.end();
+}
+
+export type Database = typeof db;

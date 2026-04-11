@@ -1,205 +1,252 @@
-# Data Layer
+# ProjectDashboard MVP Database Schema
 
-Infrastructure for managing data storage, caching, and vector embeddings.
+## Overview
+
+This document describes the database schema for the ProjectDashboard MVP (Minimum Viable Product). The schema is designed to support multi-tenant project management with AI-powered document processing and retrieval.
 
 ## Architecture
 
+- **RDBMS**: PostgreSQL for relational data (organizations, users, projects, files, chat history)
+- **Vector Store**: Pinecone or pgvector for semantic search (embeddings)
+- **ORM**: Drizzle ORM for type-safe database operations
+- **Migrations**: Drizzle Kit for schema version management
+
+## Database Tables
+
+### Organizations & Users
+
+#### `organizations`
+Multi-tenant organization table serving as the top-level entity.
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| `id` | UUID | Primary key |
+| `name` | TEXT | Organization name |
+| `onedrive_tenant_id` | TEXT | Microsoft 365 tenant ID |
+| `created_at` | TIMESTAMPTZ | Creation timestamp |
+
+#### `users`
+Users within organizations with role-based access.
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| `id` | UUID | Primary key |
+| `org_id` | UUID | Foreign key to organizations |
+| `email` | TEXT | Unique email address |
+| `name` | TEXT | User display name |
+| `role` | TEXT | 'admin', 'pm', 'super', 'member' |
+| `created_at` | TIMESTAMPTZ | Creation timestamp |
+
+### Projects & Files
+
+#### `projects`
+Container for related documents and collaboration.
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| `id` | UUID | Primary key |
+| `org_id` | UUID | Foreign key to organizations |
+| `name` | TEXT | Project name |
+| `onedrive_folder_id` | TEXT | OneDrive root folder ID |
+| `status` | TEXT | 'active', 'archived', 'deleted' |
+| `created_at` | TIMESTAMPTZ | Creation timestamp |
+
+#### `file_records`
+**Core "memory object"** - stores metadata for every file with AI-generated insights.
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| `id` | UUID | Primary key |
+| `project_id` | UUID | Foreign key to projects |
+| `onedrive_item_id` | TEXT | OneDrive unique item ID (indexed) |
+| `file_name` | TEXT | Original file name |
+| `file_path` | TEXT | Path within project folder |
+| `file_type` | TEXT | 'pdf', 'docx', 'image', 'xlsx', etc. |
+| `file_size` | BIGINT | Size in bytes |
+| `mime_type` | TEXT | MIME type |
+| **AI-Generated Metadata** | | |
+| `summary` | TEXT | AI-generated summary (≤500 chars) |
+| `key_topics` | TEXT[] | Extracted topics |
+| `tags` | TEXT[] | Auto + manual tags |
+| `doc_category` | TEXT | 'submittal', 'spec', 'drawing', 'rfi', 'photo', 'report' |
+| `spec_section` | TEXT | CSI format e.g., '23 05 00' |
+| `sheet_number` | TEXT | Drawing identifier e.g., 'A101' |
+| `revision` | TEXT | Revision identifier e.g., 'Rev 3' |
+| **Sync Metadata** | | |
+| `onedrive_etag` | TEXT | Change detection ETag |
+| `last_synced` | TIMESTAMPTZ | Last sync timestamp |
+| `index_status` | TEXT | 'pending', 'processing', 'indexed', 'failed' |
+| `last_indexed` | TIMESTAMPTZ | Last indexing timestamp |
+| `chunk_count` | INTEGER | Number of vector chunks created |
+| `created_at` | TIMESTAMPTZ | Creation timestamp |
+| `updated_at` | TIMESTAMPTZ | Last update timestamp |
+
+**Indexes**:
+- `idx_file_records_project(project_id)` - efficient project file queries
+- `idx_file_records_category(doc_category)` - filter by document type
+- `idx_file_records_tags` (GIN) - full-text search on tags array
+- `idx_file_records_spec(spec_section)` - CSI section lookup
+
+### Chat & Conversations
+
+#### `chat_sessions`
+Container for a conversation thread.
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| `id` | UUID | Primary key |
+| `project_id` | UUID | Foreign key to projects |
+| `user_id` | UUID | Foreign key to users |
+| `created_at` | TIMESTAMPTZ | Creation timestamp |
+
+#### `chat_messages`
+Individual messages in a conversation with source references.
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| `id` | UUID | Primary key |
+| `session_id` | UUID | Foreign key to chat_sessions |
+| `role` | TEXT | 'user' or 'assistant' |
+| `content` | TEXT | Message content |
+| `sources` | JSONB | [{file_id, file_name, chunk_id, relevance}] |
+| `created_at` | TIMESTAMPTZ | Creation timestamp |
+
+### Feature Registry
+
+#### `features`
+Pluggable feature definitions for dashboard icons and routes.
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| `id` | TEXT | Unique feature ID ('onedrive', 'chat', etc.) |
+| `name` | TEXT | Display name |
+| `icon` | TEXT | Icon identifier |
+| `route` | TEXT | Frontend route path |
+| `enabled` | BOOLEAN | Feature enabled globally |
+| `sort_order` | INTEGER | Dashboard display order |
+| `config` | JSONB | Feature-specific settings |
+
+#### `project_features`
+Which features are enabled per project with custom config.
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| `project_id` | UUID | Foreign key to projects |
+| `feature_id` | TEXT | Foreign key to features |
+| `enabled` | BOOLEAN | Feature enabled for this project |
+| `config` | JSONB | Project-specific feature config |
+
+**Primary Key**: (project_id, feature_id)
+
+### Vector Store & Chunks
+
+#### `vector_chunks` (Metadata only)
+Tracks which text chunks have been vectorized for semantic search.
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| `id` | UUID | Primary key |
+| `file_id` | UUID | Foreign key to file_records |
+| `chunk_index` | INTEGER | Chunk sequence number |
+| `chunk_text` | TEXT | First 500 characters (preview) |
+| `vector_id` | TEXT | Reference to Pinecone/pgvector ID |
+| `token_count` | INTEGER | Approximate token count |
+| `created_at` | TIMESTAMPTZ | Creation timestamp |
+
+**Indexes**:
+- `idx_vector_chunks_file(file_id)` - find chunks for a file
+- `idx_vector_chunks_vector_id(vector_id)` - lookup by vector store ID
+
+**Vector Store Schema** (Pinecone):
 ```
-Data Layer
-├── PostgreSQL Database
-│   ├── Users
-│   ├── Projects
-│   ├── Tasks
-│   ├── Documents
-│   ├── Chat Messages
-│   └── Activity Logs
-├── Redis Cache
-│   ├── Session management
-│   ├── Rate limiting
-│   ├── Job queues
-│   └── Real-time data
-└── Pinecone Vector Store
-    ├── Document embeddings
-    ├── Semantic search
-    └── AI-powered indexing
+Namespace: {project_id}
+
+Vector Record:
+  id:        "{file_id}_{chunk_index}"
+  values:    [1536-dim float array]  // OpenAI text-embedding-3-small
+  metadata:
+    file_id:       UUID
+    file_name:     string
+    chunk_index:   int
+    chunk_text:    string (first 500 chars)
+    doc_category:  string
+    spec_section:  string
+    sheet_number:  string
+    tags:          string[]
 ```
 
-## Components
+## Key Design Patterns
 
-### PostgreSQL Database
+### 1. Multi-Tenancy
+- Every resource is scoped to an organization (`org_id`)
+- Cascading deletes ensure data consistency
+- Row-level security can be implemented at the application layer
 
-Primary data store with Drizzle ORM.
+### 2. File Memory Objects
+- Each `file_record` acts as a "memory object" for documents
+- Stores both original metadata (OneDrive sync info) and AI insights (summary, topics)
+- Status tracking (`index_status`) enables robust processing pipelines
 
-**Schema:**
-- **users** - User accounts and authentication
-- **projects** - Construction projects
-- **tasks** - Project tasks
-- **documents** - OneDrive documents
-- **chat_messages** - Project collaboration chat
-- **activity_log** - Audit trail
-- **invitations** - User invitations
+### 3. Document Classification
+- `doc_category`: High-level classification (submittal, spec, drawing, etc.)
+- `spec_section`: CSI MasterFormat section for spec documents
+- `sheet_number`: Identifier for technical drawings (A101, etc.)
+- `tags`: Flexible tagging system for project-specific organization
 
-Run migrations:
-```bash
-npm run db:migrate
-```
+### 4. Chat Context Tracking
+- `chat_messages.sources` stores JSONB array of referenced documents
+- Enables RAG (Retrieval-Augmented Generation) implementations
+- Supports answer traceability to original documents
 
-### Redis Cache
+### 5. Feature Extensibility
+- `features` table allows dynamic dashboard features
+- `project_features` junction table enables per-project feature configuration
+- `config` JSONB columns store feature-specific settings
 
-In-memory cache for performance and real-time features.
+### 6. Semantic Search Foundation
+- `vector_chunks` table bridges RDBMS and vector store
+- Chunk metadata enables rich filtering and context in RAG pipelines
+- Supports multi-model embeddings (text, image, etc. in future)
 
-```typescript
-import { cache } from './src/cache/redis';
-
-// Get/Set cache
-await cache.set('key', value, 3600); // 1 hour TTL
-const value = await cache.get('key');
-
-// Delete
-await cache.delete('key');
-```
-
-### Pinecone Vector Store
-
-Semantic search and AI-powered document indexing.
-
-```typescript
-import { initializeVectorStore } from './src/vector-store/pinecone';
-
-const vectorStore = initializeVectorStore();
-await vectorStore.initialize();
-
-// Search similar documents
-const results = await vectorStore.search(queryEmbedding, 10);
-```
-
-## Configuration
+## Environment Configuration
 
 Set these environment variables:
 
 ```env
-# PostgreSQL
-DB_HOST=localhost
-DB_PORT=5432
-DB_USER=contractor
-DB_PASSWORD=password
-DB_NAME=contractor_db
-
-# Redis
-REDIS_HOST=localhost
-REDIS_PORT=6379
-REDIS_PASSWORD=
-
-# Pinecone
-PINECONE_API_KEY=your-api-key
-PINECONE_ENVIRONMENT=your-env
-PINECONE_INDEX=contractor-index
+DATABASE_URL=postgresql://user:password@localhost:5432/contractor-ai
 ```
 
-## Database Migrations
+## Setup & Migrations
 
-Create new migrations in `src/migrations/`:
+Generate and run migrations:
 
-```typescript
-// migrations/002_add_new_table.ts
-export async function up() {
-  // Create table
-}
-
-export async function down() {
-  // Drop table
-}
-```
-
-Run migrations:
 ```bash
+# Generate migrations from schema changes
 npm run db:migrate
-```
 
-Open DB studio:
-```bash
+# Open Drizzle Studio for visual schema exploration
 npm run db:studio
+
+# Type-check the database layer
+npm run type-check
 ```
 
-## Data Models
+## Query Patterns
 
-### Users
-```typescript
-{
-  id: UUID,
-  name: string,
-  email: string (unique),
-  passwordHash: string,
-  role: 'admin' | 'manager' | 'worker',
-  oneDriveId: string,
-  lastLogin: timestamp,
-  createdAt: timestamp,
-  updatedAt: timestamp
-}
-```
+See `src/db/queries.ts` for common query functions:
 
-### Projects
-```typescript
-{
-  id: UUID,
-  name: string,
-  description: string,
-  status: 'planning' | 'active' | 'on-hold' | 'completed',
-  progress: 0-100,
-  startDate: timestamp,
-  endDate: timestamp,
-  budget: decimal,
-  spent: decimal,
-  managerId: UUID (FK users),
-  createdAt: timestamp,
-  updatedAt: timestamp
-}
-```
+- **Organization**: Create, retrieve by ID
+- **Users**: Create, find by ID/email, list by organization
+- **Projects**: Create, retrieve, list by org, update status
+- **Files**: Create, find, list by project/category, update metadata
+- **Chat**: Create session/message, retrieve conversation history
+- **Features**: List, enable/disable per project with custom config
 
-### Tasks
-```typescript
-{
-  id: UUID,
-  projectId: UUID (FK projects),
-  title: string,
-  description: string,
-  status: 'todo' | 'in-progress' | 'review' | 'completed',
-  priority: 'low' | 'medium' | 'high',
-  assigneeId: UUID (FK users),
-  dueDate: timestamp,
-  createdAt: timestamp,
-  updatedAt: timestamp
-}
-```
+## Future Enhancements
 
-## Indexes
-
-All tables have optimized indexes for common queries:
-- `projects.manager_id_idx` - Filter projects by manager
-- `projects.status_idx` - Filter by status
-- `tasks.project_id_idx` - List project tasks
-- `tasks.assignee_id_idx` - User's assigned tasks
-- `tasks.status_idx` - Filter tasks by status
-- `chat_messages.project_id_idx` - Project messages
-- `chat_messages.created_at_idx` - Message timeline
-- `activity_log.project_id_idx` - Project audit trail
-
-## Scalability
-
-- PostgreSQL connection pooling with pg-pool
-- Redis pub/sub for real-time features
-- Pinecone for horizontal scaling of search
-- Drizzle ORM for efficient queries
-- Strategic indexes for common access patterns
-
-## Backup & Recovery
-
-Set up automated PostgreSQL backups:
-```bash
-pg_dump contractor_db > backup.sql
-```
-
-Restore from backup:
-```bash
-psql contractor_db < backup.sql
-```
+1. **Vector Search**: Implement pgvector for in-database embeddings
+2. **Full-text Search**: Add PostgreSQL full-text search on file summaries
+3. **Audit Trail**: Add audit_events table for compliance tracking
+4. **Versioning**: Add file_versions table for document version history
+5. **Permissions**: Implement project_members with granular role-based access
+6. **Notifications**: Add notification_subscriptions for real-time updates
