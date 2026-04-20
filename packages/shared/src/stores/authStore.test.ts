@@ -1,9 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useAuthStore } from '../state/authStore';
+import type { UUID, User } from '../types/entities';
 
-const demoUser = {
-  id: '1',
-  orgId: 'org-1',
+const asUuid = (value: string) => value as UUID;
+
+const demoUser: User = {
+  id: asUuid('1'),
+  orgId: asUuid('org-1'),
   name: 'Demo User',
   email: 'demo@contractor.ai',
   role: 'admin' as const,
@@ -17,8 +20,6 @@ describe('useAuthStore', () => {
     useAuthStore.setState({
       isAuthenticated: false,
       user: null,
-      accessToken: null,
-      refreshToken: null,
       isLoading: false,
       error: null,
     });
@@ -30,11 +31,18 @@ describe('useAuthStore', () => {
       JSON.stringify({
         state: {
           user: demoUser,
-          accessToken: 'saved-token',
-          refreshToken: 'saved-refresh-token',
           isAuthenticated: true,
         },
         version: 0,
+      })
+    );
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ user: demoUser }),
       })
     );
 
@@ -42,8 +50,6 @@ describe('useAuthStore', () => {
 
     expect(useAuthStore.getState()).toMatchObject({
       isAuthenticated: true,
-      accessToken: 'saved-token',
-      refreshToken: 'saved-refresh-token',
       user: expect.objectContaining({
         id: '1',
         orgId: 'org-1',
@@ -52,32 +58,78 @@ describe('useAuthStore', () => {
         role: 'admin',
       }),
     });
+    expect(fetch).toHaveBeenCalledWith('/api/auth/me', {
+      method: 'GET',
+    });
+  });
+
+  it('hydrates from cookie-backed session even without persisted auth', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ user: demoUser }),
+      })
+    );
+
+    await useAuthStore.getState().hydrate();
+
+    expect(useAuthStore.getState()).toMatchObject({
+      isAuthenticated: true,
+      user: expect.objectContaining({
+        email: 'demo@contractor.ai',
+      }),
+      error: null,
+    });
+  });
+
+  it('stays signed out without error when no cookie session exists', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 401,
+        json: async () => ({ error: 'unauthorized' }),
+      })
+    );
+
+    await useAuthStore.getState().hydrate();
+
+    expect(useAuthStore.getState()).toMatchObject({
+      isAuthenticated: false,
+      user: null,
+      error: null,
+    });
   });
 
   it('logs in and persists token and user', async () => {
+    const loginRequest = {
+      code: 'oauth-code',
+      redirectUri: 'http://localhost:3000/auth/callback',
+      state: 'oauth-state',
+    };
+
     vi.stubGlobal(
       'fetch',
       vi.fn().mockResolvedValue({
         ok: true,
         json: async () => ({
-          accessToken: 'demo-token',
-          refreshToken: 'refresh-token',
           user: demoUser,
         }),
       })
     );
 
-    await useAuthStore.getState().login('demo@contractor.ai', 'demo123');
+    await useAuthStore.getState().login(loginRequest);
 
     expect(fetch).toHaveBeenCalledWith('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'demo@contractor.ai', password: 'demo123' }),
+      body: JSON.stringify(loginRequest),
+      signal: expect.any(AbortSignal),
     });
     expect(useAuthStore.getState()).toMatchObject({
       isAuthenticated: true,
-      accessToken: 'demo-token',
-      refreshToken: 'refresh-token',
       user: demoUser,
     });
   });
@@ -87,34 +139,45 @@ describe('useAuthStore', () => {
       'fetch',
       vi.fn().mockResolvedValue({
         ok: false,
+        json: async () => ({ message: 'OAuth state is invalid or expired' }),
       })
     );
 
     await expect(
-      useAuthStore.getState().login('wrong@contractor.ai', 'bad-pass')
-    ).rejects.toThrow('Login failed');
+      useAuthStore.getState().login({
+        code: 'bad-code',
+        redirectUri: 'http://localhost:3000/auth/callback',
+        state: 'bad-state',
+      })
+    ).rejects.toThrow('OAuth state is invalid or expired');
     expect(useAuthStore.getState().isAuthenticated).toBe(false);
   });
 
   it('logs out and clears persisted auth', async () => {
-    localStorage.setItem('auth_token', 'saved-token');
-    localStorage.setItem('auth_user', JSON.stringify(demoUser));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 204,
+        json: async () => undefined,
+      })
+    );
+
     useAuthStore.setState({
       isAuthenticated: true,
       user: demoUser,
-      accessToken: 'saved-token',
-      refreshToken: 'refresh-token',
       isLoading: false,
       error: null,
     });
 
     await useAuthStore.getState().logout();
 
+    expect(fetch).toHaveBeenCalledWith('/api/auth/logout', {
+      method: 'POST',
+    });
     expect(useAuthStore.getState()).toMatchObject({
       isAuthenticated: false,
       user: null,
-      accessToken: null,
-      refreshToken: null,
     });
   });
 });

@@ -3,14 +3,47 @@
  * Initializes the backend API server with middleware and routes
  */
 
-import express, { Request, Response, NextFunction } from "express";
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+import express, { type Express, Request, Response, NextFunction } from "express";
 import dotenv from "dotenv";
 import { initializeDb } from "./db";
-import { getOAuthConfig } from "./auth/oauth";
-import type { AuthMeResponse } from "@contractor/shared";
+import type {
+  AuthLoginRequest,
+  CreateChatSessionRequest,
+  CreateProjectRequest,
+  OneDriveConnectRequest,
+  OneDriveSyncRequest,
+  SendChatMessageRequest,
+  UpdateProjectFeatureRequest,
+} from "@contractor/shared";
+import { getEnv, hasMicrosoftOAuthConfig } from "./config/env";
+import { AppError, asyncHandler, isAppError } from "./lib/errors";
+import { logger } from "./lib/logger";
+import {
+  authService,
+  chatService,
+  featureService,
+  healthService,
+  indexingService,
+  onedriveService,
+  projectService,
+  startIndexingWorker,
+  syncService,
+} from "./services";
+import { toUuid } from "./services/service-types";
 
-// Load environment variables
-dotenv.config();
+// Load environment variables from both package and workspace root locations.
+const dotenvCandidates = [
+  path.resolve(process.cwd(), ".env"),
+  path.resolve(__dirname, "../.env"),
+  path.resolve(__dirname, "../../.env"),
+  path.resolve(__dirname, "../../../.env"),
+];
+
+for (const envPath of [...new Set(dotenvCandidates)]) {
+  dotenv.config({ path: envPath, override: false });
+}
 
 // ================================
 // Types
@@ -19,10 +52,14 @@ dotenv.config();
 declare global {
   namespace Express {
     interface Request {
+      requestId?: string;
       user?: {
         id: string;
         email: string;
+        name: string;
         orgId: string;
+        orgName: string;
+        role: "super" | "admin" | "pm" | "member";
       };
       orgId?: string;
     }
@@ -34,167 +71,156 @@ declare global {
 // ================================
 
 /**
- * Auth middleware (stub - implement JWT verification in Phase 2)
+ * Auth middleware for bearer session tokens issued by authService.
  */
 function authMiddleware(
   req: Request,
-  res: Response,
+  _res: Response,
   next: NextFunction
 ): void {
-  // TODO: Verify JWT from Authorization header
-  // For MVP phase 1, this is a placeholder
   const authHeader = req.headers.authorization;
-  if (authHeader?.startsWith("Bearer ")) {
-    const token = authHeader.slice(7);
-    // TODO: Verify and decode token, set req.user
-    console.log("Token received (verification not implemented yet):", token.slice(0, 20) + "...");
+
+  void (async () => {
+    if (authHeader?.startsWith("Bearer ")) {
+      const token = authHeader.slice(7);
+      const user = await authService.getRequestUser(token);
+
+      if (user) {
+        req.user = user;
+        req.orgId = user.orgId;
+        logger.info("auth.token.received", {
+          requestId: req.requestId,
+          tokenPreview: `${token.slice(0, 8)}...`,
+        });
+      }
+    }
+
+    next();
+  })().catch(next);
+}
+
+function requireAuthenticatedRequest(
+  req: Request,
+  _res: Response,
+  next: NextFunction
+): void {
+  if (!req.user || !req.orgId) {
+    next(new AppError(401, "unauthorized", "Unauthorized"));
+    return;
   }
+
   next();
 }
 
 // ================================
 // ROUTE HANDLERS (Stubs for Phase 1)
 // ================================
-
-/**
- * Auth Routes
- */
-async function handleAuthLogin(req: Request, res: Response): Promise<void> {
-  try {
-    const { code, redirectUri } = req.body as {
-      code: string;
-      redirectUri: string;
-    };
-
-    if (!code) {
-      res.status(400).json({ error: "Missing authorization code" });
-      return;
-    }
-
-    // TODO: Phase 1.3 - Exchange code for tokens, create/get user
-    res.json({
-      accessToken: "stub-token",
-      refreshToken: "stub-refresh",
-      expiresIn: 3600,
-      user: {
-        id: "stub-user-id",
-        email: "contractor@example.com",
-        name: "Demo Contractor",
-        orgId: "stub-org-id",
-        role: "admin",
-        createdAt: new Date(),
-      },
-    });
-  } catch (error) {
-    console.error("Login error:", error);
-    res.status(500).json({ error: "Login failed" });
-  }
-}
-
-async function handleAuthMe(req: Request, res: Response): Promise<void> {
-  if (!req.user) {
-    res.status(401).json({ error: "Unauthorized" });
-    return;
-  }
-
-  const response: AuthMeResponse = {
-    user: {
-      id: req.user.id as any,
-      email: req.user.email,
-      orgId: req.user.orgId as any,
-      name: "User",
-      role: "member",
-      createdAt: new Date(),
-    },
-    organization: {
-      id: req.user.orgId as any,
-      name: "Default Org",
-    },
-  };
-
+const handleAuthLogin = asyncHandler(async (req, res) => {
+  const response = await authService.login(req.body as AuthLoginRequest);
   res.json(response);
-}
+});
 
-/**
- * OneDrive Routes (stubs)
- */
-async function handleOneDriveConnect(req: Request, res: Response): Promise<void> {
-  const { code, redirectUri } = req.body;
-  // TODO: Exchange code for OneDrive token, validate scopes
-  res.json({ connected: true, message: "OneDrive connection initiated" });
-}
+const handleAuthMe = asyncHandler(async (req, res) => {
+  const response = await authService.getCurrentUser(req.user);
+  res.json(response);
+});
 
-async function handleOneDriveStatus(req: Request, res: Response): Promise<void> {
-  res.json({
-    connected: false,
-    syncInProgress: false,
-    fileCount: 0,
-  });
-}
+const handleOneDriveConnect = asyncHandler(async (req, res) => {
+  const response = await onedriveService.connect(
+    req.body as OneDriveConnectRequest,
+    req.user
+  );
+  res.json(response);
+});
 
-async function handleOneDriveSync(req: Request, res: Response): Promise<void> {
-  const { projectId } = req.body;
-  // TODO: Queue sync job in Redis
-  res.json({ syncStarted: true, message: "Sync queued", jobId: "job-123" });
-}
+const handleOneDriveConnectStart = asyncHandler(async (req, res) => {
+  const redirectUri =
+    typeof req.query.redirectUri === "string" ? req.query.redirectUri : undefined;
+  res.json(onedriveService.getConnectUrl(req.user, redirectUri));
+});
 
-/**
- * Projects Routes (stubs)
- */
-async function handleGetProjects(req: Request, res: Response): Promise<void> {
-  res.json({ projects: [] });
-}
+const handleOneDriveStatus = asyncHandler(async (req, res) => {
+  res.json(await onedriveService.getStatus(req.user));
+});
 
-async function handleCreateProject(req: Request, res: Response): Promise<void> {
-  const { name, onedriveFolderId } = req.body;
-  res.json({
-    project: {
-      id: "project-123",
-      orgId: req.orgId || "org-123",
-      name,
-      onedriveFolderId,
-      status: "active",
-      createdAt: new Date(),
-    },
-  });
-}
+const handleOneDriveSync = asyncHandler(async (req, res) => {
+  const body = req.body as OneDriveSyncRequest;
+  res.json(await syncService.syncProjectMetadata(body.projectId, req.user, req.orgId));
+});
 
-/**
- * Chat Routes (stubs)
- */
-async function handleCreateChatSession(req: Request, res: Response): Promise<void> {
-  const { projectId } = req.body;
-  res.json({
-    session: {
-      id: "session-123",
-      projectId,
-      userId: req.user?.id || "user-123",
-      createdAt: new Date(),
-    },
-  });
-}
+const handleGetProjects = asyncHandler(async (req, res) => {
+  res.json(await projectService.listProjects(req.orgId));
+});
 
-async function handleSendChatMessage(req: Request, res: Response): Promise<void> {
-  const { sessionId } = req.params;
-  const { message } = req.body as { message: string };
+const handleCreateProject = asyncHandler(async (req, res) => {
+  const response = await projectService.createProject(
+    req.body as CreateProjectRequest,
+    req.orgId
+  );
+  res.json(response);
+});
 
-  res.json({
-    messageId: "msg-123",
-    role: "assistant",
-    content: `Echo: ${message}`,
-    sources: [],
-    createdAt: new Date(),
-  });
-}
+const handleCreateChatSession = asyncHandler(async (req, res) => {
+  const body = req.body as CreateChatSessionRequest;
+  res.json(await chatService.createSession(body.projectId, req.user));
+});
+
+const handleSendChatMessage = asyncHandler(async (req, res) => {
+  const body = req.body as SendChatMessageRequest;
+  res.json(await chatService.sendMessage(toUuid(req.params.id), body.message));
+});
+
+const handleGetProjectFeatures = asyncHandler(async (req, res) => {
+  res.json(await featureService.getProjectFeatures(toUuid(req.params.id)));
+});
+
+const handleUpdateProjectFeature = asyncHandler(async (req, res) => {
+  const body = req.body as UpdateProjectFeatureRequest;
+  res.json(
+    await featureService.updateProjectFeature(
+      toUuid(req.params.id),
+      req.params.fid,
+      body.enabled,
+      body.config
+    )
+  );
+});
+
+const handleGetFeatureRegistry = asyncHandler(async (_req, res) => {
+  res.json(await featureService.getRegistry());
+});
 
 // ================================
 // APP INITIALIZATION
 // ================================
 
-async function createApp() {
+async function createApp(): Promise<Express> {
   const app = express();
 
   // Middleware
+  app.use((req, res, next) => {
+    req.requestId = randomUUID();
+    res.setHeader("x-request-id", req.requestId);
+
+    const startedAt = Date.now();
+    logger.info("http.request.started", {
+      requestId: req.requestId,
+      method: req.method,
+      path: req.path,
+    });
+
+    res.on("finish", () => {
+      logger.info("http.request.completed", {
+        requestId: req.requestId,
+        method: req.method,
+        path: req.path,
+        statusCode: res.statusCode,
+        durationMs: Date.now() - startedAt,
+      });
+    });
+
+    next();
+  });
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
 
@@ -202,91 +228,173 @@ async function createApp() {
   app.use(authMiddleware);
 
   // Health check
-  app.get("/health", (req, res) => {
-    res.json({ status: "ok", timestamp: new Date() });
-  });
+  app.get("/health", asyncHandler(async (_req, res) => {
+    const health = await healthService.getSystemHealth();
+    const statusCode = health.status === "error" ? 503 : 200;
+    res.status(statusCode).json(health);
+  }));
+  app.get("/health/api", asyncHandler(async (_req, res) => {
+    res.json(await healthService.getApiHealth());
+  }));
+  app.get("/health/db", asyncHandler(async (_req, res) => {
+    const health = await healthService.getDatabaseHealth();
+    res.status(health.status === "error" ? 503 : 200).json(health);
+  }));
+  app.get("/health/queue", asyncHandler(async (_req, res) => {
+    const health = await healthService.getQueueHealth();
+    res.status(health.status === "error" ? 503 : 200).json(health);
+  }));
 
   // ================================
   // API ROUTES
   // ================================
 
   // Auth
+  app.get("/api/auth/login", asyncHandler(async (req, res) => {
+    const redirectUri = typeof req.query.redirectUri === "string"
+      ? req.query.redirectUri
+      : undefined;
+    const prompt = typeof req.query.prompt === "string"
+      ? req.query.prompt
+      : undefined;
+    const allowedPrompt =
+      prompt === "select_account" || prompt === "login" || prompt === "consent"
+        ? prompt
+        : undefined;
+    const { authorizationUrl } = authService.getLoginUrl(redirectUri, allowedPrompt);
+    res.redirect(302, authorizationUrl);
+  }));
   app.post("/api/auth/login", handleAuthLogin);
-  app.post("/api/auth/refresh", (req, res) => {
-    res.json({ accessToken: "new-token", expiresIn: 3600 });
-  });
+  app.post("/api/auth/refresh", asyncHandler(async (req, res) => {
+    const refreshToken = (req.body as { refreshToken?: string }).refreshToken ?? "";
+    res.json(await authService.refresh(refreshToken));
+  }));
+  app.post("/api/auth/logout", asyncHandler(async (req, res) => {
+    const authHeader = req.headers.authorization;
+    const accessToken = authHeader?.startsWith("Bearer ")
+      ? authHeader.slice(7)
+      : undefined;
+    const refreshToken = (req.body as { refreshToken?: string }).refreshToken;
+
+    await authService.logout(accessToken, refreshToken);
+    res.status(204).send();
+  }));
   app.get("/api/auth/me", handleAuthMe);
 
   // OneDrive
-  app.post("/api/onedrive/connect", handleOneDriveConnect);
-  app.get("/api/onedrive/status", handleOneDriveStatus);
-  app.post("/api/onedrive/sync", handleOneDriveSync);
-  app.get("/api/onedrive/browse", (req, res) => {
-    res.json({ items: [] });
-  });
+  app.get(
+    "/api/onedrive/connect/start",
+    requireAuthenticatedRequest,
+    handleOneDriveConnectStart
+  );
+  app.post("/api/onedrive/connect", requireAuthenticatedRequest, handleOneDriveConnect);
+  app.get("/api/onedrive/status", requireAuthenticatedRequest, handleOneDriveStatus);
+  app.post("/api/onedrive/sync", requireAuthenticatedRequest, handleOneDriveSync);
+  app.get("/api/onedrive/browse", requireAuthenticatedRequest, asyncHandler(async (req, res) => {
+    const folderId = typeof req.query.folderId === "string" ? req.query.folderId : undefined;
+    res.json(await onedriveService.browse(req.user, folderId));
+  }));
 
   // Projects
-  app.get("/api/projects", handleGetProjects);
-  app.post("/api/projects", handleCreateProject);
-  app.get("/api/projects/:id", (req, res) => {
-    res.json({
-      project: {
-        id: req.params.id,
-        name: "Project",
-        status: "active",
-      },
-      onedrive: { connected: false },
-      fileCount: 0,
+  app.get("/api/projects", requireAuthenticatedRequest, handleGetProjects);
+  app.post("/api/projects", requireAuthenticatedRequest, handleCreateProject);
+  app.get("/api/projects/:id", requireAuthenticatedRequest, asyncHandler(async (req, res) => {
+    res.json(await projectService.getProjectDetails(toUuid(req.params.id)));
+  }));
+  app.get("/api/projects/:id/files", requireAuthenticatedRequest, asyncHandler(async (req, res) => {
+    const page = Number(req.query.page ?? 1);
+    const pageSize = Number(req.query.pageSize ?? 50);
+    const search = typeof req.query.search === "string" ? req.query.search : undefined;
+    const category = typeof req.query.category === "string" ? req.query.category : undefined;
+    const tags = typeof req.query.tags === "string"
+      ? req.query.tags
+        .split(",")
+        .map((tag) => tag.trim())
+        .filter(Boolean)
+      : undefined;
+
+    const projectId = toUuid(req.params.id);
+    await projectService.getProjectOrThrow(projectId, req.orgId);
+
+    const response = await projectService.listProjectFiles(projectId, {
+      page,
+      pageSize,
+      search,
+      category,
+      tags,
     });
-  });
-  app.get("/api/projects/:id/files", (req, res) => {
-    res.json({ files: [], total: 0, page: 1, pageSize: 50, hasMore: false });
-  });
+    res.json(response);
+  }));
+  app.get("/api/projects/:id/indexing/progress", requireAuthenticatedRequest, asyncHandler(async (req, res) => {
+    const projectId = toUuid(req.params.id);
+    await projectService.getProjectOrThrow(projectId, req.orgId);
+    res.json(await indexingService.getProjectIndexingProgress(projectId));
+  }));
+  app.get("/api/projects/:id/sync/progress", requireAuthenticatedRequest, asyncHandler(async (req, res) => {
+    const projectId = toUuid(req.params.id);
+    await projectService.getProjectOrThrow(projectId, req.orgId);
+    res.json(syncService.getProjectSyncProgress(projectId));
+  }));
+  app.get("/api/projects/:id/chunks", requireAuthenticatedRequest, asyncHandler(async (req, res) => {
+    const projectId = toUuid(req.params.id);
+    await projectService.getProjectOrThrow(projectId, req.orgId);
+    res.json({ chunks: await projectService.listProjectChunks(projectId) });
+  }));
+  app.get("/api/projects/:id/retrieval/preview", requireAuthenticatedRequest, asyncHandler(async (req, res) => {
+    const projectId = toUuid(req.params.id);
+    await projectService.getProjectOrThrow(projectId, req.orgId);
+    const query = typeof req.query.q === "string" ? req.query.q : "";
+    res.json({ sources: await retrievalService.retrieveSources(projectId, query) });
+  }));
 
   // Chat
-  app.post("/api/chat/sessions", handleCreateChatSession);
-  app.get("/api/chat/sessions", (req, res) => {
-    res.json({ sessions: [] });
-  });
-  app.post("/api/chat/sessions/:id/message", handleSendChatMessage);
-  app.get("/api/chat/sessions/:id/messages", (req, res) => {
-    res.json({ messages: [], total: 0 });
-  });
+  app.post("/api/chat/sessions", requireAuthenticatedRequest, handleCreateChatSession);
+  app.get("/api/chat/sessions", requireAuthenticatedRequest, asyncHandler(async (_req, res) => {
+    res.json(await chatService.listSessions());
+  }));
+  app.post("/api/chat/sessions/:id/message", requireAuthenticatedRequest, handleSendChatMessage);
+  app.get("/api/chat/sessions/:id/messages", requireAuthenticatedRequest, asyncHandler(async (req, res) => {
+    res.json(await chatService.getHistory(toUuid(req.params.id)));
+  }));
 
   // Features
-  app.get("/api/projects/:id/features", (req, res) => {
-    res.json({ features: [] });
-  });
-  app.put("/api/projects/:id/features/:fid", (req, res) => {
-    res.json({ feature: {} });
-  });
-  app.get("/api/features/registry", (req, res) => {
-    res.json({
-      features: [
-        {
-          id: "onedrive",
-          name: "OneDrive",
-          icon: "cloud",
-          route: "/onedrive",
-          enabled: true,
-          sortOrder: 1,
-        },
-        {
-          id: "chat",
-          name: "Chat",
-          icon: "message",
-          route: "/chat",
-          enabled: true,
-          sortOrder: 2,
-        },
-      ],
+  app.get("/api/projects/:id/features", handleGetProjectFeatures);
+  app.put("/api/projects/:id/features/:fid", handleUpdateProjectFeature);
+  app.get("/api/features/registry", handleGetFeatureRegistry);
+
+  app.use((req, res) => {
+    res.status(404).json({
+      error: "Not Found",
+      message: `No route registered for ${req.method} ${req.path}`,
+      requestId: req.requestId,
     });
   });
 
   // Default error handler
   app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
-    console.error("Unhandled error:", err);
-    res.status(500).json({ error: "Internal Server Error" });
+    const statusCode = isAppError(err) ? err.statusCode : 500;
+    logger.error("http.request.failed", err, {
+      requestId: req.requestId,
+      method: req.method,
+      path: req.path,
+      statusCode,
+    });
+
+    if (isAppError(err)) {
+      res.status(err.statusCode).json({
+        error: err.code,
+        message: err.message,
+        details: err.details,
+        requestId: req.requestId,
+      });
+      return;
+    }
+
+    res.status(500).json({
+      error: "internal_server_error",
+      message: "Internal Server Error",
+      requestId: req.requestId,
+    });
   });
 
   return app;
@@ -298,33 +406,80 @@ async function createApp() {
 
 async function startServer() {
   try {
-    // Validate OAuth config
-    getOAuthConfig();
-    console.log("✓ OAuth2 configuration loaded");
+    const env = getEnv();
 
-    // Initialize database
-    const dbUrl = process.env.DATABASE_URL;
-    if (!dbUrl) {
-      throw new Error("DATABASE_URL environment variable is required");
+    if (hasMicrosoftOAuthConfig(env)) {
+      logger.info("auth.oauth.config.loaded", {
+        redirectUri: env.oauthRedirectUri,
+      });
+    } else {
+      logger.warn("auth.oauth.config.missing", {
+        message: "Microsoft OAuth is not configured yet. Auth routes remain stubbed.",
+      });
     }
 
-    await initializeDb(dbUrl);
-    console.log("✓ Database initialized");
+    // Initialize database when configured; otherwise continue in in-memory mode.
+    if (env.databaseUrl) {
+      await initializeDb(env.databaseUrl);
+      logger.info("database.initialized", {
+        hasRedisConfig: Boolean(env.redisUrl),
+      });
+    } else {
+      logger.warn("database.config.missing", {
+        message:
+          "DATABASE_URL is not configured. Starting backend with in-memory fallbacks for local testing.",
+      });
+    }
+
+    const indexingWorkerRuntime = startIndexingWorker();
 
     // Create and start Express app
     const app = await createApp();
-    const PORT = process.env.PORT || 3001;
 
-    app.listen(PORT, () => {
-      console.log(`
-╔══════════════════════════════════════════╗
-║     ContractorAI MVP Backend             ║
-║     Ready on http://localhost:${PORT}      ║
-╚══════════════════════════════════════════╝
-      `);
+    const server = app.listen(env.port, () => {
+      logger.info("server.started", {
+        port: env.port,
+        baseUrl: env.apiBaseUrl,
+        healthUrl: `${env.apiBaseUrl}/health`,
+      });
+    });
+
+    const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
+      logger.info("server.shutdown.started", { signal });
+
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+
+          resolve();
+        });
+      });
+
+      if (indexingWorkerRuntime) {
+        await indexingWorkerRuntime.close();
+      }
+
+      logger.info("server.shutdown.completed", { signal });
+      process.exit(0);
+    };
+
+    process.once("SIGINT", () => {
+      void shutdown("SIGINT").catch((error) => {
+        logger.error("server.shutdown.failed", error, { signal: "SIGINT" });
+        process.exit(1);
+      });
+    });
+    process.once("SIGTERM", () => {
+      void shutdown("SIGTERM").catch((error) => {
+        logger.error("server.shutdown.failed", error, { signal: "SIGTERM" });
+        process.exit(1);
+      });
     });
   } catch (error) {
-    console.error("Failed to start server:", error);
+    logger.error("server.start.failed", error);
     process.exit(1);
   }
 }

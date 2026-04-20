@@ -1,8 +1,6 @@
 # ContractorAI — MVP
 
-A construction document management and AI chat platform for contractors. Connect your OneDrive, index your documents, and search them with natural language through an AI chatbot.
-
-**One codebase → iOS App + Android App + Web App**
+A construction document management and AI chat platform for contractors. The current MVP focus is the web workflow: connect OneDrive, sync documents, and ask grounded questions with citations.
 
 ## What's In The Box
 
@@ -79,7 +77,7 @@ contractor-ai/
 ### Prerequisites
 
 - Node.js 18+
-- pnpm (recommended) or npm/yarn
+- pnpm 10+
 - PostgreSQL 14+
 - Redis 7+
 
@@ -90,23 +88,97 @@ contractor-ai/
 git clone https://github.com/georgegao-ops/ProjectDshboard.git contractor-ai-mvp
 cd contractor-ai-mvp
 
-# Install dependencies (using workspace feature)
+# Install dependencies
 pnpm install
 
 # Set up environment variables
-cp .env.example .env.local
+cp .env.example .env
 
-# Run database migrations
-pnpm -F @contractor/backend run db:migrate
-
-# Development: start all apps in parallel
-pnpm dev
-
-# Or individually:
-pnpm -F @contractor/mobile dev
+# Start the web app and backend in separate terminals
+pnpm -F @contractor/backend dev
 pnpm -F @contractor/web dev
+```
+
+### Required Local Services
+
+- PostgreSQL for the backend database (`DATABASE_URL`)
+- Redis for queue connectivity and health checks (`REDIS_URL`)
+
+### Environment Variables
+
+The repository uses a single `.env` file in local development. Phase 0 standardizes these variables:
+
+```env
+# Runtime
+NODE_ENV=development
+PORT=3001
+API_BASE_URL=http://localhost:3001
+
+# Backend dependencies
+DATABASE_URL=postgresql://user:password@localhost:5432/contractor_ai
+REDIS_URL=redis://localhost:6379
+
+# Microsoft OAuth
+MICROSOFT_CLIENT_ID=your-client-id-here
+MICROSOFT_CLIENT_SECRET=your-client-secret-here
+OAUTH_REDIRECT_URI=http://localhost:3000/auth/callback
+
+# Frontend
+NEXT_PUBLIC_API_URL=http://localhost:3001
+EXPO_PUBLIC_API_BASE_URL=http://localhost:3001
+```
+
+### Local Microsoft OAuth Setup (Required For Login)
+
+If login shows "Microsoft OAuth is not configured", your backend is running but `MICROSOFT_CLIENT_ID` and `MICROSOFT_CLIENT_SECRET` are empty.
+
+1. Create or open an app registration in Azure Portal.
+2. Add a Web redirect URI:
+	- `http://localhost:3000/auth/callback`
+	- `http://localhost:3000/onedrive/callback`
+3. Ensure delegated Microsoft Graph permissions include:
+	- `openid`
+	- `profile`
+	- `email`
+	- `offline_access`
+	- `Files.Read`
+4. Copy values into root `.env`:
+
+```env
+MICROSOFT_CLIENT_ID=<your-app-client-id>
+MICROSOFT_CLIENT_SECRET=<your-app-client-secret>
+OAUTH_REDIRECT_URI=http://localhost:3000/auth/callback
+```
+
+Important:
+- OneDrive connect uses `http://localhost:3000/onedrive/callback`.
+- Microsoft requires an exact redirect URI match per OAuth request.
+- If login works but OneDrive connect fails with `invalid_request` for `redirect_uri`, the OneDrive callback URI is missing in the app registration.
+
+5. Restart backend after changing `.env`:
+
+```bash
 pnpm -F @contractor/backend dev
 ```
+
+6. Verify auth start returns a redirect (expected status: 302):
+
+```bash
+node -e "(async()=>{const r=await fetch('http://localhost:3001/api/auth/login?redirectUri='+encodeURIComponent('http://localhost:3000/auth/callback'),{redirect:'manual'}); console.log('status='+r.status); console.log('location='+(r.headers.get('location')||''));})();"
+```
+
+Expected result:
+- `status=302`
+- `location` contains `login.microsoftonline.com`
+
+If you still see `status=503` with `oauth_not_configured`, the backend process has not loaded valid OAuth credentials yet.
+
+### Health Endpoints
+
+- `GET /health` returns overall API, database, and queue status
+- `GET /health/api` returns process-level health
+- `GET /health/db` validates database connectivity
+- `GET /health/queue` validates Redis connectivity when configured
 
 ## MVP Timeline
 
@@ -176,34 +248,6 @@ pnpm -F @contractor/shared build
 3. Run tests: `pnpm test`
 4. Create a PR to `main`
 5. Merge after review
-
-## Environment Variables
-
-Copy `.env.example` to `.env.local` and configure:
-
-```env
-# Backend
-DATABASE_URL=postgresql://user:password@localhost:5432/contractor_ai
-REDIS_URL=redis://localhost:6379
-
-# Microsoft OAuth (Azure AD)
-MSAL_CLIENT_ID=your-client-id
-MSAL_CLIENT_SECRET=your-secret
-MSAL_TENANT_ID=your-tenant
-
-# OneDrive
-ONEDRIVE_API_ENDPOINT=https://graph.microsoft.com/v1.0
-
-# AI / Embeddings
-OPENAI_API_KEY=sk-...
-CLAUDE_API_KEY=sk-ant-...
-PINECONE_API_KEY=your-key
-PINECONE_ENVIRONMENT=your-environment
-
-# Exports
-NEXT_PUBLIC_API_URL=http://localhost:3000
-NEXT_PUBLIC_WS_URL=ws://localhost:3000
-```
 
 ## Contributing
 

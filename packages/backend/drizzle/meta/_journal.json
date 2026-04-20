@@ -1,0 +1,20 @@
+{
+  "version": "5",
+  "dialect": "pg",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1776210495654,
+      "tag": "0000_deep_spot",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1776217495654,
+      "tag": "0001_onedrive_connections",
+      "breakpoints": true
+    }
+  ]
+}

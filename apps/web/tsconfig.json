@@ -2,7 +2,7 @@
   "extends": "../../tsconfig.json",
   "compilerOptions": {
     "outDir": ".next",
-    "rootDir": ".",
+    "rootDir": "../..",
     "allowJs": true,
     "noEmit": true,
     "incremental": true,

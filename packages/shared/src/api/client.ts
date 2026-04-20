@@ -6,7 +6,6 @@
 import type {
   AuthLoginRequest,
   AuthLoginResponse,
-  AuthRefreshRequest,
   AuthTokenResponse,
   AuthMeResponse,
   OneDriveConnectRequest,
@@ -32,8 +31,8 @@ import type {
   UpdateProjectFeatureResponse,
   FeaturesRegistryResponse,
   ErrorResponse,
-} from "./api";
-import type { UUID } from "./entities";
+} from "../types/api";
+import type { UUID } from "../types/entities";
 
 export interface ApiClientConfig {
   baseUrl: string;
@@ -46,7 +45,7 @@ export class ApiClient {
   private baseUrl: string;
   private timeout: number;
   private accessToken?: string;
-  private refreshToken?: string;
+  private storedRefreshToken?: string;
   private onTokenRefresh?: (tokens: AuthTokenResponse) => void;
   private onAuthError?: () => void;
 
@@ -114,13 +113,13 @@ export class ApiClient {
   setTokens(accessToken: string, refreshToken?: string): void {
     this.accessToken = accessToken;
     if (refreshToken) {
-      this.refreshToken = refreshToken;
+      this.storedRefreshToken = refreshToken;
     }
   }
 
   clearTokens(): void {
     this.accessToken = undefined;
-    this.refreshToken = undefined;
+    this.storedRefreshToken = undefined;
   }
 
   // ================================
@@ -134,7 +133,7 @@ export class ApiClient {
   }
 
   async refreshToken(): Promise<AuthTokenResponse> {
-    if (!this.refreshToken) {
+    if (!this.storedRefreshToken) {
       throw new Error("No refresh token available");
     }
 
@@ -142,11 +141,11 @@ export class ApiClient {
       "POST",
       "/api/auth/refresh",
       {
-        body: { refreshToken: this.refreshToken },
+        body: { refreshToken: this.storedRefreshToken },
       }
     );
 
-    this.setTokens(response.accessToken, this.refreshToken);
+    this.setTokens(response.accessToken, this.storedRefreshToken);
     this.onTokenRefresh?.(response);
 
     return response;

@@ -137,10 +137,13 @@ export interface ProjectFeature {
  */
 export interface OneDriveStatus {
   connected: boolean;
-  refreshToken?: string;
   lastSyncedAt?: Date;
   syncInProgress: boolean;
   fileCount?: number;
+  accountEmail?: string;
+  tenantId?: string;
+  driveId?: string;
+  driveType?: string;
 }
 
 /**

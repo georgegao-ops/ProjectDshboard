@@ -3,6 +3,8 @@
  * Handles authentication flow with Microsoft Azure AD
  */
 
+import { getEnv } from "../config/env";
+
 export interface OAuthConfig {
   clientId: string;
   clientSecret: string;
@@ -14,6 +16,7 @@ export interface OAuthConfig {
 export interface TokenSet {
   accessToken: string;
   refreshToken: string;
+  idToken?: string;
   expiresIn: number;
   tokenType: string;
   scope: string;
@@ -23,10 +26,11 @@ export interface TokenSet {
  * Get OAuth configuration from environment
  */
 export function getOAuthConfig(): OAuthConfig {
+  const env = getEnv();
   const config: OAuthConfig = {
-    clientId: process.env.MICROSOFT_CLIENT_ID || "",
-    clientSecret: process.env.MICROSOFT_CLIENT_SECRET || "",
-    redirectUri: process.env.OAUTH_REDIRECT_URI || "http://localhost:3000/auth/callback",
+    clientId: env.microsoftClientId || "",
+    clientSecret: env.microsoftClientSecret || "",
+    redirectUri: env.oauthRedirectUri,
     scopes: [
       "openid",
       "profile",
@@ -34,7 +38,7 @@ export function getOAuthConfig(): OAuthConfig {
       "offline_access", // for refresh token
       "Files.Read", // OneDrive read access
     ],
-    authority: "https://login.microsoftonline.com/common",
+    authority: `https://login.microsoftonline.com/${env.microsoftTenantId ?? "common"}`,
   };
 
   if (!config.clientId || !config.clientSecret) {
@@ -49,14 +53,21 @@ export function getOAuthConfig(): OAuthConfig {
 /**
  * Construct OAuth authorization URL
  */
-export function getAuthorizationUrl(state: string, codeChallenge?: string): string {
+export function getAuthorizationUrl(
+  state: string,
+  codeChallenge?: string,
+  redirectUri?: string,
+  scopes?: string[],
+  prompt?: "select_account" | "login" | "consent"
+): string {
   const config = getOAuthConfig();
   const params = new URLSearchParams({
     client_id: config.clientId,
-    redirect_uri: config.redirectUri,
+    redirect_uri: redirectUri ?? config.redirectUri,
     response_type: "code",
-    scope: config.scopes.join(" "),
+    scope: (scopes ?? config.scopes).join(" "),
     state,
+    ...(prompt && { prompt }),
     ...(codeChallenge && {
       code_challenge: codeChallenge,
       code_challenge_method: "S256",
@@ -72,7 +83,9 @@ export function getAuthorizationUrl(state: string, codeChallenge?: string): stri
  */
 export async function exchangeCodeForTokens(
   code: string,
-  codeVerifier?: string
+  codeVerifier?: string,
+  redirectUri?: string,
+  scopes?: string[]
 ): Promise<TokenSet> {
   const config = getOAuthConfig();
 
@@ -80,8 +93,9 @@ export async function exchangeCodeForTokens(
     client_id: config.clientId,
     client_secret: config.clientSecret,
     code,
-    redirect_uri: config.redirectUri,
+    redirect_uri: redirectUri ?? config.redirectUri,
     grant_type: "authorization_code",
+    scope: (scopes ?? config.scopes).join(" "),
     ...(codeVerifier && { code_verifier: codeVerifier }),
   });
 
@@ -102,6 +116,7 @@ export async function exchangeCodeForTokens(
   const data = await response.json() as {
     access_token: string;
     refresh_token?: string;
+    id_token?: string;
     expires_in: number;
     token_type: string;
     scope: string;
@@ -110,6 +125,7 @@ export async function exchangeCodeForTokens(
   return {
     accessToken: data.access_token,
     refreshToken: data.refresh_token || "",
+    idToken: data.id_token,
     expiresIn: data.expires_in,
     tokenType: data.token_type,
     scope: data.scope,
@@ -120,7 +136,8 @@ export async function exchangeCodeForTokens(
  * Refresh an access token using refresh token
  */
 export async function refreshAccessToken(
-  refreshToken: string
+  refreshToken: string,
+  scopes?: string[]
 ): Promise<TokenSet> {
   const config = getOAuthConfig();
 
@@ -129,7 +146,7 @@ export async function refreshAccessToken(
     client_secret: config.clientSecret,
     refresh_token: refreshToken,
     grant_type: "refresh_token",
-    scope: config.scopes.join(" "),
+    scope: (scopes ?? config.scopes).join(" "),
   });
 
   const response = await fetch(
@@ -149,6 +166,7 @@ export async function refreshAccessToken(
   const data = await response.json() as {
     access_token: string;
     refresh_token?: string;
+    id_token?: string;
     expires_in: number;
     token_type: string;
     scope: string;
@@ -157,6 +175,7 @@ export async function refreshAccessToken(
   return {
     accessToken: data.access_token,
     refreshToken: data.refresh_token || refreshToken,
+    idToken: data.id_token,
     expiresIn: data.expires_in,
     tokenType: data.token_type,
     scope: data.scope,

@@ -1,5 +1,4 @@
 // @ts-check
-import withNx from "@nx/next/plugins/with-nx.js";
 
 /**
  * @type {import('next').NextConfig}
@@ -13,4 +12,4 @@ const nextConfig = {
   },
 };
 
-export default withNx(nextConfig);
+export default nextConfig;

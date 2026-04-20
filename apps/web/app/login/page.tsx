@@ -1,79 +1,57 @@
 'use client';
 
-import { useAuthStore } from '@contractor/shared';
-import { useRouter } from 'next/navigation';
-import { useState } from 'react';
+import { useSearchParams } from 'next/navigation';
 import './login.css';
 
+function getErrorMessage(error: string | null, message: string | null): string | null {
+  if (message) {
+    return message;
+  }
+
+  if (error === 'oauth_not_configured') {
+    return 'Microsoft OAuth is not configured. Set MICROSOFT_CLIENT_ID and MICROSOFT_CLIENT_SECRET in your local environment.';
+  }
+
+  if (error === 'backend_unreachable') {
+    return 'Backend API is unavailable. Start the backend service on localhost:3001 and retry.';
+  }
+
+  return null;
+}
+
 export default function LoginPage() {
-  const router = useRouter();
-  const { login } = useAuthStore();
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(false);
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError('');
-    setLoading(true);
-
-    try {
-      await login(email, password);
-      router.push('/');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Login failed');
-    } finally {
-      setLoading(false);
-    }
-  };
+  const searchParams = useSearchParams();
+  const redirectUri = typeof window === 'undefined'
+    ? undefined
+    : `${window.location.origin}/auth/callback`;
+  const authUrl = redirectUri
+    ? `/api/auth/login?redirectUri=${encodeURIComponent(redirectUri)}&prompt=select_account`
+    : '/api/auth/login';
+  const errorParam = searchParams?.get?.('error') ?? null;
+  const messageParam = searchParams?.get?.('message') ?? null;
+  const errorMessage = getErrorMessage(
+    errorParam,
+    messageParam
+  );
 
   return (
     <div className="login-container">
       <div className="login-box">
         <div className="login-header">
           <h1>Contractor Dashboard</h1>
-          <p>Sign in to your account</p>
+          <p>Sign in with Microsoft to access your projects and documents.</p>
         </div>
 
-        <form onSubmit={handleSubmit} className="login-form">
-          <div className="form-group">
-            <label htmlFor="email">Email</label>
-            <input
-              id="email"
-              type="email"
-              placeholder="Enter your email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              required
-              disabled={loading}
-            />
-          </div>
-
-          <div className="form-group">
-            <label htmlFor="password">Password</label>
-            <input
-              id="password"
-              type="password"
-              placeholder="Enter your password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required
-              disabled={loading}
-            />
-          </div>
-
-          {error && <div className="error-message">{error}</div>}
-
-          <button type="submit" className="btn btn-primary btn-lg" disabled={loading}>
-            {loading ? 'Signing in...' : 'Sign In'}
-          </button>
-        </form>
+        <div className="login-form">
+          {errorMessage ? <div className="error-message">{errorMessage}</div> : null}
+          <a href={authUrl} className="btn btn-primary btn-lg">
+            Continue with Microsoft
+          </a>
+        </div>
 
         <div className="login-footer">
-          <p>Demo credentials:</p>
-          <p>Email: demo@contractor.ai</p>
-          <p>Password: demo123</p>
+          <p>Your Microsoft account is used for authentication.</p>
+          <p>The backend completes the OAuth exchange and issues the app session.</p>
         </div>
       </div>
     </div>

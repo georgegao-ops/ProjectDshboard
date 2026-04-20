@@ -1,93 +1,142 @@
 /**
  * Auth Store — Using Zustand for cross-platform state management
- * Stores authentication tokens, user info, and auth state
+ * Stores authenticated user state for the web MVP.
  */
 
+import type { AuthLoginRequest } from "../types/api";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { User } from "../types/entities";
 
 export interface AuthState {
   user: User | null;
-  accessToken: string | null;
-  refreshToken: string | null;
   isAuthenticated: boolean;
   isLoading: boolean;
   error: string | null;
 
-  // Actions
-  login: (email: string, password: string) => Promise<void>;
+  login: (request: AuthLoginRequest) => Promise<void>;
   hydrate: () => Promise<void>;
-  setAuth: (user: User, accessToken: string, refreshToken: string) => void;
-  setTokens: (accessToken: string, refreshToken: string) => void;
-  logout: () => void;
+  setAuth: (user: User) => void;
+  logout: () => Promise<void>;
   setLoading: (loading: boolean) => void;
   setError: (error: string | null) => void;
+}
+
+async function fetchJson<T>(
+  input: RequestInfo | URL,
+  init?: RequestInit
+): Promise<{ ok: boolean; status: number; data: T }> {
+  const response = await fetch(input, init);
+  const data = (await response.json().catch(() => undefined)) as T;
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    data,
+  };
 }
 
 export const useAuthStore = create<AuthState>()(
   persist(
     (set) => ({
       user: null,
-      accessToken: null,
-      refreshToken: null,
       isAuthenticated: false,
       isLoading: false,
       error: null,
 
-      login: async (email, password) => {
+      login: async (request) => {
         set({ isLoading: true, error: null });
 
         try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 15_000);
           const response = await fetch("/api/auth/login", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ email, password }),
+            body: JSON.stringify(request),
+            signal: controller.signal,
           });
+          clearTimeout(timeoutId);
 
           if (!response.ok) {
-            throw new Error("Login failed");
+            const data = (await response.json()) as { message?: string };
+            throw new Error(data.message ?? "Login failed");
           }
 
-          const data = await response.json();
+          const data = (await response.json()) as { user: User };
           set({
             user: data.user,
-            accessToken: data.accessToken ?? data.token ?? null,
-            refreshToken: data.refreshToken ?? null,
             isAuthenticated: true,
             isLoading: false,
             error: null,
           });
         } catch (error) {
-          const message = error instanceof Error ? error.message : "Login failed";
+          const message =
+            error instanceof Error && error.name === "AbortError"
+              ? "Sign-in timed out while finalizing the callback. Retry from /login."
+              : error instanceof Error
+                ? error.message
+                : "Login failed";
           set({ isLoading: false, error: message });
-          throw error;
+          throw new Error(message);
         }
       },
 
       hydrate: async () => {
         await useAuthStore.persist.rehydrate();
+
+        set({ isLoading: true, error: null });
+
+        try {
+          const meResponse = await fetchJson<{ user: User }>("/api/auth/me", {
+            method: "GET",
+          });
+
+          if (!meResponse.ok || !meResponse.data?.user) {
+            if (meResponse.status === 401) {
+              set({
+                user: null,
+                isAuthenticated: false,
+                isLoading: false,
+                error: null,
+              });
+              return;
+            }
+
+            throw new Error("Session expired. Sign in again.");
+          }
+
+          set({
+            user: meResponse.data.user,
+            isAuthenticated: true,
+            isLoading: false,
+            error: null,
+          });
+        } catch (error) {
+          set({
+            user: null,
+            isAuthenticated: false,
+            isLoading: false,
+            error: error instanceof Error ? error.message : "Session expired. Sign in again.",
+          });
+        }
       },
 
-      setAuth: (user, accessToken, refreshToken) => {
+      setAuth: (user) => {
         set({
           user,
-          accessToken,
-          refreshToken,
           isAuthenticated: true,
           error: null,
         });
       },
 
-      setTokens: (accessToken, refreshToken) => {
-        set({ accessToken, refreshToken });
-      },
+      logout: async () => {
+        await fetch("/api/auth/logout", {
+          method: "POST",
+        }).catch(() => undefined);
 
-      logout: () => {
         set({
           user: null,
-          accessToken: null,
-          refreshToken: null,
           isAuthenticated: false,
           error: null,
         });
@@ -100,8 +149,6 @@ export const useAuthStore = create<AuthState>()(
       name: "auth-storage",
       partialize: (state) => ({
         user: state.user,
-        accessToken: state.accessToken,
-        refreshToken: state.refreshToken,
         isAuthenticated: state.isAuthenticated,
       }),
     }

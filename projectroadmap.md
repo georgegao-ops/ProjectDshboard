@@ -154,6 +154,38 @@ Build as a sequence of vertical slices. Each phase should leave the repository i
 - Sessions persist reliably across refreshes
 - Authenticated users land in the correct onboarding or project flow
 
+### Phase 1 Implementation Notes
+
+- Auth is now backend-owned and web sessions are stored in an HTTP-only `app_session` cookie.
+- The web app rehydrates auth through `GET /api/auth/me`; logout clears the cookie and revokes the backend session.
+- Backend session storage supports a Postgres-backed `auth_sessions` path, with in-memory fallback only for tests or no-database contexts.
+
+### Phase 1 Future-Phase Notes
+
+- Apply `packages/backend/drizzle/0000_deep_spot.sql` before relying on durable sessions. It is currently a bootstrap/full-schema migration because the repo had no earlier Drizzle migration history.
+- Phase 2 should reuse the existing authenticated app user context for OneDrive and project setup rather than introducing a second session or identity model.
+- Post-login routing is still a placeholder and should be finalized alongside onboarding/project selection work in Phase 2.
+
+### Phase 2 Implementation Notes
+
+- OneDrive OAuth is now wired end-to-end through backend-owned connect start/callback exchange (`/api/onedrive/connect/start` and `/api/onedrive/connect`) with web proxy routes.
+- OneDrive folder browsing is backed by Microsoft Graph (`/api/onedrive/browse`) and supports root/up navigation and explicit folder selection before project creation.
+- OneDrive connection data (tenant/account/drive metadata and refresh token) now persists in `onedrive_connections` with in-memory fallback for test/no-database contexts.
+
+### Phase 2 Pre-Phase-3 Checklist
+
+- Apply `packages/backend/drizzle/0001_onedrive_connections.sql` so OneDrive connections survive backend restarts in local/staging environments.
+- Keep `ONEDRIVE_API_ENDPOINT` pointed at Microsoft Graph v1.0 unless a tenant-specific override is required.
+- Confirm OneDrive status displays account and tenant metadata after reconnect to validate durable token path before sync implementation.
+
+### Phase 2 Learnings Needed For Phase 3
+
+- OAuth callback reliability depends on exact redirect URI matching per flow (`/auth/callback` and `/onedrive/callback` must both be registered exactly, including protocol, host, port, and path).
+- Microsoft SSO can auto-select an existing signed-in account; this is expected behavior and should not be treated as a sync regression by itself.
+- OneDrive browse-only success is not sufficient validation for sync readiness; Phase 3 needs explicit callback failure visibility and server-side logging around token exchange and Graph API calls.
+- Route tests can pass while local OAuth runtime still fails due to environment drift. Keep a runtime probe in the Phase 3 debug workflow: backend health endpoint plus auth/connect redirect verification.
+- Durable OneDrive token storage must be verified before sync work; otherwise file inventory can appear to work in-memory but fail after backend restarts.
+
 ## Phase 2 - OneDrive Connection and Project Setup
 
 ### Goals
@@ -249,6 +281,33 @@ Build as a sequence of vertical slices. Each phase should leave the repository i
 - File inventory is accurate
 - Sync updates reflect correctly in UI
 - Unsupported or failed files are visible to the user
+
+### Phase 3 Kickoff Notes (Started April 15, 2026)
+
+- Implemented recursive OneDrive metadata traversal in backend service layer for project folder sync.
+- Implemented manual sync metadata flow that:
+  - scans files recursively,
+  - classifies supported vs unsupported files (PDF/DOCX supported for MVP),
+  - persists file inventory in service memory for current runtime,
+  - returns sync summary counts needed by UI.
+- Wired backend `GET /api/projects/:id/files` to return real paginated inventory data with search/category/tag filters.
+- Added web proxy routes for:
+  - `POST /api/onedrive/sync`
+  - `GET /api/projects/:id/files`
+- Added/updated tests validating end-to-end sync summary and file inventory route behavior.
+
+### Phase 3 Immediate Next Steps
+
+- [Completed] Persist sync file inventory and sync run summaries in Postgres with in-memory fallback.
+- [Completed] Add first file inventory UI panel with manual sync trigger, sync summary, and unsupported-file visibility.
+- [Completed] Add delta-aware file persistence (preserve unchanged file indexing state by etag).
+- [In progress] Emit structured sync run logs and user-facing error states for Graph pagination/rate-limit failures.
+
+### Phase 3 Next Technical Tasks
+
+- Persist OneDrive file traversal cursors or delta tokens to reduce full recursive scans for large folders.
+- Add sync failure analytics and retry telemetry by sync run id.
+- Add file inventory pagination controls and filters in web UI (status, unsupported, search).
 
 ## Phase 4 - Indexing Pipeline
 

@@ -22,6 +22,7 @@ import type {
 export interface AuthLoginRequest {
   code: string; // OAuth2 authorization code
   redirectUri: string;
+  state?: string;
 }
 
 export interface AuthLoginResponse {
@@ -55,6 +56,12 @@ export interface AuthMeResponse {
 export interface OneDriveConnectRequest {
   code: string; // OAuth2 code from Microsoft
   redirectUri: string;
+  state: string;
+}
+
+export interface OneDriveConnectStartResponse {
+  authorizationUrl: string;
+  state: string;
 }
 
 export interface OneDriveConnectResponse {
@@ -72,6 +79,10 @@ export interface OneDriveSyncResponse {
   syncStarted: boolean;
   message: string;
   jobId?: string;
+  scannedFileCount?: number;
+  supportedFileCount?: number;
+  unsupportedFileCount?: number;
+  lastSyncedAt?: Date;
 }
 
 export interface OneDriveBrowseItem {

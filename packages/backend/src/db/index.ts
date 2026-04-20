@@ -35,5 +35,9 @@ export function getDb() {
   return db;
 }
 
+export function getDbIfInitialized() {
+  return db;
+}
+
 // Export schema for migrations
 export * from "./schema";

@@ -1,56 +1,36 @@
-import { render, screen, waitFor } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { render, screen } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
 import LoginPage from './page';
 
-const mockPush = vi.fn();
-const mockLogin = vi.fn();
-
-vi.mock('@contractor/shared', () => ({
-  useAuthStore: () => ({
-    login: mockLogin,
-  }),
-}));
-
 vi.mock('next/navigation', () => ({
-  useRouter: () => ({
-    push: mockPush,
-  }),
+  useSearchParams: () => new URLSearchParams(window.location.search),
 }));
 
 describe('Login page', () => {
-  beforeEach(() => {
-    mockPush.mockReset();
-    mockLogin.mockReset();
+  it('renders a Microsoft sign-in link that points at the web auth proxy route', () => {
+    window.history.pushState({}, '', 'http://localhost:3000/login');
+    render(<LoginPage />);
+
+    expect(
+      screen.getByRole('link', { name: 'Continue with Microsoft' })
+    ).toHaveAttribute(
+      'href',
+      '/api/auth/login?redirectUri=http%3A%2F%2Flocalhost%3A3000%2Fauth%2Fcallback&prompt=select_account'
+    );
+    expect(
+      screen.getByText('The backend completes the OAuth exchange and issues the app session.')
+    ).toBeInTheDocument();
   });
 
-  it('submits demo credentials and redirects to the dashboard', async () => {
-    const user = userEvent.setup();
-    mockLogin.mockResolvedValue(undefined);
+  it('renders a friendly setup message when OAuth is not configured', () => {
+    window.history.pushState(
+      {},
+      '',
+      'http://localhost:3000/login?error=oauth_not_configured&message=Microsoft%20OAuth%20is%20not%20configured'
+    );
 
     render(<LoginPage />);
 
-    await user.type(screen.getByLabelText('Email'), 'demo@contractor.ai');
-    await user.type(screen.getByLabelText('Password'), 'demo123');
-    await user.click(screen.getByRole('button', { name: 'Sign In' }));
-
-    await waitFor(() => {
-      expect(mockLogin).toHaveBeenCalledWith('demo@contractor.ai', 'demo123');
-      expect(mockPush).toHaveBeenCalledWith('/');
-    });
-  });
-
-  it('renders the login error when authentication fails', async () => {
-    const user = userEvent.setup();
-    mockLogin.mockRejectedValue(new Error('Login failed'));
-
-    render(<LoginPage />);
-
-    await user.type(screen.getByLabelText('Email'), 'wrong@contractor.ai');
-    await user.type(screen.getByLabelText('Password'), 'bad-pass');
-    await user.click(screen.getByRole('button', { name: 'Sign In' }));
-
-    expect(await screen.findByText('Login failed')).toBeInTheDocument();
-    expect(mockPush).not.toHaveBeenCalled();
+    expect(screen.getByText('Microsoft OAuth is not configured')).toBeInTheDocument();
   });
 });
