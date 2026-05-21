@@ -24,8 +24,49 @@ import {
   jsonb,
   primaryKey,
   index,
+  customType,
 } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
+
+// ================================
+// CUSTOM TYPES
+// ================================
+
+/**
+ * pgvector column type — stores a floating-point vector.
+ * The `dimensions` config is baked into the SQL type.
+ */
+export const vector = customType<{ data: number[]; driverData: string; config: { dimensions: number } }>({
+  dataType(config) {
+    return `vector(${config?.dimensions ?? 1536})`;
+  },
+  toDriver(value: number[]): string {
+    return `[${value.join(",")}]`;
+  },
+  fromDriver(value: string): number[] {
+    return value.replace(/^\[|\]$/g, "").split(",").map(Number);
+  },
+});
+
+// Full set of construction document categories
+export const CONSTRUCTION_CATEGORIES = [
+  "drawing",
+  "rfi",
+  "submittal",
+  "change_order",
+  "contract",
+  "schedule",
+  "spec",
+  "meeting_minutes",
+  "permit",
+  "invoice",
+  "safety",
+  "photo",
+  "report",
+  "correspondence",
+  "unknown",
+] as const;
+export type ConstructionCategory = (typeof CONSTRUCTION_CATEGORIES)[number];
 
 // ================================
 // ORGANIZATIONS (Multi-tenant)
@@ -178,12 +219,35 @@ export const fileRecords = pgTable(
     summary: text("summary"),
     keyTopics: text("key_topics").array(),
     tags: text("tags").array(),
-    docCategory: text("doc_category", {
-      enum: ["submittal", "spec", "drawing", "rfi", "photo", "report"],
-    }),
+    // Full construction category set — enforced at application layer
+    docCategory: text("doc_category"),
     specSection: text("spec_section"), // e.g., "23 05 00"
     sheetNumber: text("sheet_number"), // e.g., "A101"
     revision: text("revision"), // e.g., "Rev 3"
+
+    // Construction intelligence — extracted structured fields
+    // e.g. { rfiNumber, submittarNumber, vendor, dateApproved, costImpact, ... }
+    extractedFields: jsonb("extracted_fields"),
+
+    // Priority score 0-100; higher = process first
+    priorityScore: integer("priority_score").default(50).notNull(),
+    processingMode: text("processing_mode", {
+      enum: ["full", "reduced", "metadata_only"],
+    })
+      .default("full")
+      .notNull(),
+    processingReason: text("processing_reason"),
+    reducedCoverage: boolean("reduced_coverage").default(false).notNull(),
+    extractedContentPercent: integer("extracted_content_percent"),
+    normalizedTextObjectKey: text("normalized_text_object_key"),
+    normalizedTextChecksum: text("normalized_text_checksum"),
+    normalizedTextLength: integer("normalized_text_length"),
+    normalizedTextStoredAt: timestamp("normalized_text_stored_at", { withTimezone: true }),
+    encryptionKeyVersion: integer("encryption_key_version"),
+
+    // Change detection
+    versionHash: text("version_hash"),
+    owner: text("owner"),
 
     // Sync metadata
     onedriveEtag: text("onedrive_etag"),
@@ -227,9 +291,20 @@ export const fileChunks = pgTable(
     fileName: text("file_name").notNull(),
     chunkIndex: integer("chunk_index").notNull(),
     chunkText: text("chunk_text").notNull(),
+    sourceType: text("source_type", {
+      enum: ["content", "summary", "metadata_stub"],
+    })
+      .default("content")
+      .notNull(),
+    pageNumber: integer("page_number"),
+    sectionLabel: text("section_label"),
+    metadata: jsonb("metadata").default(sql`'{}'::jsonb`).notNull(),
     tokenCount: integer("token_count").default(0).notNull(),
     embeddingModel: text("embedding_model").notNull(),
+    // Legacy JSONB embedding (kept for backward-compat, populated by older code)
     embedding: jsonb("embedding"),
+    // pgvector column for high-performance ANN search
+    embeddingVector: vector("embedding_vector", { dimensions: 1536 }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
       .notNull(),
@@ -238,6 +313,8 @@ export const fileChunks = pgTable(
     projectIdx: index("idx_file_chunks_project").on(table.projectId),
     fileIdx: index("idx_file_chunks_file").on(table.fileId),
     onedriveItemIdx: index("idx_file_chunks_onedrive_item").on(table.onedriveItemId),
+    sourceTypeIdx: index("idx_file_chunks_source_type").on(table.sourceType),
+    pageNumberIdx: index("idx_file_chunks_page_number").on(table.pageNumber),
   })
 );
 
@@ -300,6 +377,38 @@ export const syncRuns = pgTable(
   })
 );
 
+export const rechunkRuns = pgTable(
+  "rechunk_runs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    projectId: uuid("project_id")
+      .references(() => projects.id)
+      .notNull(),
+    fileId: uuid("file_id")
+      .references(() => fileRecords.id)
+      .notNull(),
+    status: text("status", {
+      enum: ["pending", "in_progress", "completed", "failed"],
+    })
+      .default("pending")
+      .notNull(),
+    triggerReason: text("trigger_reason").notNull(),
+    strategyVersion: text("strategy_version").default("v1").notNull(),
+    errorMessage: text("error_message"),
+    startedAt: timestamp("started_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => ({
+    projectIdx: index("idx_rechunk_runs_project").on(table.projectId),
+    fileIdx: index("idx_rechunk_runs_file").on(table.fileId),
+    statusIdx: index("idx_rechunk_runs_status").on(table.status),
+    createdAtIdx: index("idx_rechunk_runs_created_at").on(table.createdAt),
+  })
+);
+
 // ================================
 // CHAT SESSIONS & MESSAGES
 // ================================
@@ -334,6 +443,8 @@ export const chatMessages = pgTable(
     role: text("role", { enum: ["user", "assistant"] }).notNull(),
     content: text("content").notNull(),
     sources: jsonb("sources"), // [{file_id, file_name, chunk_id, relevance}]
+    interpretation: jsonb("interpretation"),
+    feedback: jsonb("feedback"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
       .notNull(),
@@ -372,6 +483,63 @@ export const projectFeatures = pgTable(
   },
   (table) => ({
     projectFeaturePk: primaryKey({ columns: [table.projectId, table.featureId] }),
+  })
+);
+
+// ================================
+// DOCUMENT RELATIONSHIPS
+// ================================
+
+export const documentRelationships = pgTable(
+  "document_relationships",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    projectId: uuid("project_id")
+      .references(() => projects.id, { onDelete: "cascade" })
+      .notNull(),
+    sourceFileId: uuid("source_file_id")
+      .references(() => fileRecords.id, { onDelete: "cascade" })
+      .notNull(),
+    targetFileId: uuid("target_file_id")
+      .references(() => fileRecords.id, { onDelete: "cascade" })
+      .notNull(),
+    // 'references' | 'supersedes' | 'responds_to' | 'tied_to' | 'part_of'
+    relationType: text("relation_type").notNull(),
+    confidence: integer("confidence").default(80).notNull(),
+    metadata: jsonb("metadata"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => ({
+    projectIdx: index("idx_doc_relationships_project").on(table.projectId),
+    sourceIdx: index("idx_doc_relationships_source").on(table.sourceFileId),
+    targetIdx: index("idx_doc_relationships_target").on(table.targetFileId),
+  })
+);
+
+// ================================
+// INDEXING ERRORS
+// ================================
+
+export const indexingErrors = pgTable(
+  "indexing_errors",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    projectId: uuid("project_id")
+      .references(() => projects.id, { onDelete: "cascade" })
+      .notNull(),
+    fileId: uuid("file_id").references(() => fileRecords.id, { onDelete: "cascade" }),
+    onedriveItemId: text("onedrive_item_id"),
+    fileName: text("file_name"),
+    // 'metadata' | 'download' | 'extract' | 'chunk' | 'embed' | 'classify'
+    stage: text("stage").notNull(),
+    errorCode: text("error_code").notNull(),
+    errorMessage: text("error_message").notNull(),
+    attempt: integer("attempt").default(1).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => ({
+    projectIdx: index("idx_indexing_errors_project").on(table.projectId),
+    fileIdx: index("idx_indexing_errors_file").on(table.fileId),
   })
 );
 

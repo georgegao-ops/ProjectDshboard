@@ -17,6 +17,8 @@ import type {
   ProjectListResponse,
   CreateProjectRequest,
   CreateProjectResponse,
+  UpdateProjectFolderRequest,
+  UpdateProjectFolderResponse,
   ProjectDetailsResponse,
   ProjectFilesRequest,
   ProjectFilesResponse,
@@ -195,6 +197,19 @@ export class ApiClient {
     });
   }
 
+  async updateProjectFolder(
+    projectId: UUID,
+    req: UpdateProjectFolderRequest
+  ): Promise<UpdateProjectFolderResponse> {
+    return this.request<UpdateProjectFolderResponse>(
+      "PATCH",
+      `/api/projects/${projectId}`,
+      {
+        body: req,
+      }
+    );
+  }
+
   async getProject(projectId: UUID): Promise<ProjectDetailsResponse> {
     return this.request<ProjectDetailsResponse>("GET", `/api/projects/${projectId}`);
   }
@@ -236,10 +251,11 @@ export class ApiClient {
   async sendChatMessage(
     req: SendChatMessageRequest
   ): Promise<SendChatMessageResponse> {
+    const { sessionId, ...body } = req;
     return this.request<SendChatMessageResponse>(
       "POST",
-      `/api/chat/sessions/${req.sessionId}/message`,
-      { body: req }
+      `/api/chat/sessions/${sessionId}/message`,
+      { body }
     );
   }
 

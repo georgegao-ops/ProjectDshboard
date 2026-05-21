@@ -303,6 +303,42 @@ Build as a sequence of vertical slices. Each phase should leave the repository i
 - [Completed] Add delta-aware file persistence (preserve unchanged file indexing state by etag).
 - [In progress] Emit structured sync run logs and user-facing error states for Graph pagination/rate-limit failures.
 
+### Phase 3 Continuation Notes (Updated April 19, 2026)
+
+#### Current State
+
+- Project selection now auto-triggers sync (including re-selecting the same project).
+- Sync progress endpoint is wired end-to-end and displayed in the dashboard with a filling progress bar.
+- Client-side sync timeout was removed to avoid false failures on large folders.
+- OneDrive Graph calls now include retry/backoff handling for transient failures (including throttling/server errors).
+- Sync failures now return structured user-facing messages instead of only generic server failure states.
+- Web and targeted backend tests for sync/progress flows are passing.
+
+#### Known Behavior To Keep In Mind
+
+- Unsupported files are expected for MVP when type is not PDF/DOCX or file size exceeds the current max file size limit.
+- XLS/XLSX and other non-PDF/DOCX files are inventoried but intentionally not indexed in this phase.
+
+### Phase 4.6 Maintenance Notes (May 2026)
+
+- Added embedding provider preflight gating before indexing file batches. If preflight fails, indexing is paused with an explicit reason and files remain pending.
+- Added bounded embedding retry taxonomy:
+  - Retry transient failures (rate-limit, provider unavailable, network/timeout)
+  - Fail fast for fatal auth/config/request failures
+- Added project-scoped embedding circuit-breaker cooldown to avoid repeated mass failures in a single run.
+- Enriched indexing diagnostics payload with grouped failure reasons (stage + error code), pause/circuit state, and anomaly reporting.
+- Hardened indexing error persistence to record stage-specific failures with redacted/safe messages.
+- Added focused backend tests for embeddings retry/fatal semantics and indexing diagnostics helper behavior.
+- Removed dead duplicate fallback embedding path in favor of explicit fail-closed behavior and clearer operational states.
+
+#### Next Resume Checklist
+
+- Capture sync failure telemetry by sync run id (Graph status code, folder/item id, retry count, final error reason).
+- Add optional skip-with-warning behavior for inaccessible subtrees/files so one bad path does not fail a full sync.
+- Add dashboard file inventory filters for unsupported/failed status to improve operator triage.
+- Decide whether to keep strict PDF/DOCX scope for MVP or begin scoped XLSX support with tests.
+- If XLSX support is approved, implement extraction path in indexing pipeline and update sync supported MIME list.
+
 ### Phase 3 Next Technical Tasks
 
 - Persist OneDrive file traversal cursors or delta tokens to reduce full recursive scans for large folders.
@@ -388,6 +424,64 @@ Build as a sequence of vertical slices. Each phase should leave the repository i
 
 - Answers are relevant, grounded, and correctly cited
 - Retrieval quality is acceptable on a repeatable evaluation set, not just ad hoc demos
+
+### Phase 4.5 Kickoff Notes (Started April 20, 2026)
+
+- Added retrieval tuning controls in backend retrieval service:
+  - configurable `topK` (bounded)
+  - configurable minimum relevance threshold
+  - metadata filtering by document category and tags
+- Extended retrieval preview endpoint to accept tuning/filter query params for iterative quality checks.
+- Added retrieval service unit tests for:
+  - deduped ranking behavior
+  - metadata filter behavior
+  - threshold/top-k behavior
+- Added a retrieval evaluation utility with repeatable metrics:
+  - hit rate at k
+  - mean recall
+  - mean reciprocal rank
+- Added unit tests for evaluation metric computations.
+
+### Phase 4.5 Immediate Next Steps
+
+- Define an initial contractor-focused query set and expected source file IDs for pilot evaluation.
+- Run baseline retrieval quality snapshots per project and log metric deltas when tuning changes are made.
+- Add lightweight endpoint or internal script to run evaluation cases against current retrieval settings.
+
+### Phase 4.6 Evidence-Backed RAG Notes (Updated April 29, 2026)
+
+- Added chunk provenance fields to `file_chunks`:
+  - `source_type` (`content`, `summary`, `metadata_stub`)
+  - `page_number`
+  - `section_label`
+  - `metadata` JSONB
+- Indexing pipeline now emits enriched chunk records instead of plain text chunks only.
+- Retrieval now applies intent-aware source-type policy:
+  - fact queries prioritize `content`
+  - overview queries can boost `summary`
+  - `metadata_stub` is gated to drawing/sheet-intent queries
+- Chat coordinator now preserves chunk identity and returns validated `citations[]` payloads.
+- Added uncertainty marker behavior when a factual response has no validated chunk evidence.
+
+### Phase 4.6 Immediate Next Steps
+
+- Add rollout feature flags for write-path/read-path/citation/backfill gates.
+- Add backfill worker controls (cohorting, concurrency caps, pause thresholds).
+- Add dedicated adversarial tests for citation spoofing and page-confidence behavior.
+
+### Maintenance Notes (Updated May 1, 2026)
+
+- Removed dead backend code:
+  - `indexingService.getQueuePolicy()` — unused method; `INDEXING_QUEUE_POLICY` is consumed directly by the queue module.
+  - `chatService.listSessions()` and `chatService.getHistory()` — unused methods superseded by authenticated `listSessionsForUser` / `getHistoryForUser` paths.
+- Retrieval note:
+  - `inMemorySearch()` and `cosineSimilarity()` are intentionally retained as no-DB fallback behavior for local/dev modes and tests.
+- Fixed duplicate keyword hit counting: `retrieval.service.ts` was computing keyword hits inline instead of using the shared `keywordHitScore` from `text-ranking.utils.ts`. Now uses the shared util.
+- Removed dead retrieval artifacts: dropped unused `drizzle-orm` imports (`and`, `desc`), removed an unused DB initialization in `getProjectContext`, and marked the optional `getSuggestions` query arg as intentionally unused to keep intent explicit and avoid drift.
+- Cleaned barrel export (`services/index.ts`): removed re-exports of purely internal implementation services (`constructionClassifierService`, `embeddingsService`, `indexingPipelineService`, `priorityScoringService`, `evaluateRetrievalCase`, `evaluateRetrievalSet`). These were never consumed via the barrel — all callers import directly. The barrel now only exposes services that are consumed by `server.ts` or external route files.
+- Applied adversarial fix for PATCH `/api/projects/:id`: sync now fires as a background task (`void syncProjectMetadata(...)`) instead of being awaited inline, eliminating the potential HTTP timeout for large folders. `resetProjectSyncProgress` now sets `inProgress: true` so the 1-second poll never emits a false "idle" state between reset and sync start.
+- Consolidated duplicated web API proxy helpers (`getBackendBaseUrl`, auth cookie/session token handling, safe JSON parsing) into `apps/web/app/api/_lib/proxy.ts` and rewired chat/project proxy routes to consume the shared helper.
+- Performed a second chat/retrieval cleanup pass (no behavior change): removed a duplicated recency regex token, inlined redundant fallback locals in chat routing, and centralized repeated single-file source construction in `chat-coordinator.service.ts`.
 
 ## Phase 5 - Chat System
 

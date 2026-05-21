@@ -1,0 +1,171 @@
+# =============================================================
+# docker-compose.yml — ContractorAI Indexing Branch
+#
+# Services:
+#   postgres  - PostgreSQL 16 with pgvector extension
+#   redis     - Redis 7 for BullMQ job queues
+#   backend   - Node.js/Express API + indexing workers
+#   web       - Next.js frontend (optional for local dev)
+#
+# Usage:
+#   docker compose up -d          # start all services
+#   docker compose logs -f backend # tail backend logs
+#   docker compose down -v        # destroy everything
+# =============================================================
+
+version: "3.9"
+
+# -------------------------------------------------------
+# Named volumes
+# -------------------------------------------------------
+volumes:
+  postgres_data:
+  redis_data:
+
+# -------------------------------------------------------
+# Custom network
+# -------------------------------------------------------
+networks:
+  contractor_net:
+    driver: bridge
+
+services:
+
+  # ======================================================
+  # PostgreSQL 16 + pgvector
+  # ======================================================
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: contractor_postgres
+    restart: unless-stopped
+    networks:
+      - contractor_net
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-contractor}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-contractor_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-contractorai}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Run pgvector CREATE EXTENSION on first boot
+      - ./infra/init-pgvector.sql:/docker-entrypoint-initdb.d/01-pgvector.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-contractor} -d ${POSTGRES_DB:-contractorai}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ======================================================
+  # Redis 7 (BullMQ queues)
+  # ======================================================
+  redis:
+    image: redis:7-alpine
+    container_name: contractor_redis
+    restart: unless-stopped
+    networks:
+      - contractor_net
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ======================================================
+  # Backend API + Indexing Workers
+  # ======================================================
+  backend:
+    build:
+      context: .
+      dockerfile: packages/backend/Dockerfile
+    container_name: contractor_backend
+    restart: unless-stopped
+    networks:
+      - contractor_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      DATABASE_URL: postgresql://${POSTGRES_USER:-contractor}:${POSTGRES_PASSWORD:-contractor_dev_password}@postgres:5432/${POSTGRES_DB:-contractorai}
+      REDIS_URL: redis://redis:6379
+      API_BASE_URL: ${API_BASE_URL:-http://localhost:3001}
+      # Microsoft OAuth
+      MICROSOFT_CLIENT_ID: ${MICROSOFT_CLIENT_ID:-}
+      MICROSOFT_CLIENT_SECRET: ${MICROSOFT_CLIENT_SECRET:-}
+      MICROSOFT_TENANT_ID: ${MICROSOFT_TENANT_ID:-common}
+      OAUTH_REDIRECT_URI: ${OAUTH_REDIRECT_URI:-http://localhost:3000/auth/callback}
+      # Gemini chat answers (preferred) + OpenAI-compatible fallback
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_CHAT_MODEL: ${GEMINI_CHAT_MODEL:-gemini-2.5-flash}
+      GEMINI_CHAT_ENDPOINT: ${GEMINI_CHAT_ENDPOINT:-https://generativelanguage.googleapis.com/v1beta/openai/chat/completions}
+      # OpenAI-compatible fallback
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_CHAT_MODEL: ${OPENAI_CHAT_MODEL:-gpt-4.1-mini}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
+      INDEXING_EXTRACTOR_PIPELINE_V2_ENABLED: ${INDEXING_EXTRACTOR_PIPELINE_V2_ENABLED:-false}
+      DOC_PARSER_TIMEOUT_MS: ${DOC_PARSER_TIMEOUT_MS:-12000}
+      DOC_PARSER_ENDPOINT: ${DOC_PARSER_ENDPOINT:-http://docling-sidecar:8080/parse}
+      RETRIEVAL_HYBRID_ENABLED: ${RETRIEVAL_HYBRID_ENABLED:-false}
+      RETRIEVAL_BLEND_PROFILE: ${RETRIEVAL_BLEND_PROFILE:-balanced}
+      RETRIEVAL_RERANK_ENABLED: ${RETRIEVAL_RERANK_ENABLED:-false}
+      RETRIEVAL_RERANK_TOP_N: ${RETRIEVAL_RERANK_TOP_N:-20}
+      RETRIEVAL_RERANK_PROVIDER: ${RETRIEVAL_RERANK_PROVIDER:-none}
+    ports:
+      - "${BACKEND_PORT:-3001}:3001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:3001/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ======================================================
+  # Next.js Frontend (optional — can run with pnpm locally)
+  # ======================================================
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    container_name: contractor_web
+    restart: unless-stopped
+    networks:
+      - contractor_net
+    depends_on:
+      - backend
+    environment:
+      BACKEND_API_URL: ${BACKEND_API_URL:-http://backend:3001}
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001}
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:3000 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # ======================================================
+  # Optional Docling sidecar (PR3 shadow mode)
+  # ======================================================
+  docling-sidecar:
+    image: ghcr.io/docling-project/docling-serve:latest
+    container_name: contractor_docling_sidecar
+    restart: unless-stopped
+    profiles: ["docling"]
+    networks:
+      - contractor_net
+    ports:
+      - "${DOCLING_PORT:-8088}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5

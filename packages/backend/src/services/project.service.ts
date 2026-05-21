@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { and, desc, eq, inArray } from "drizzle-orm";
+﻿import { randomUUID } from "node:crypto";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import type {
   CreateProjectRequest,
   CreateProjectResponse,
@@ -23,6 +23,45 @@ import { toUuid } from "./service-types";
 const projectsByOrg = new Map<string, CreateProjectResponse["project"][]>();
 const filesByProject = new Map<string, FileRecord[]>();
 const syncTimesByProject = new Map<string, Date>();
+const IN_CLAUSE_BATCH_SIZE = 250;
+let fileChunksVectorColumnIsNativeVector: boolean | undefined;
+
+async function shouldWriteEmbeddingVector(): Promise<boolean> {
+  if (typeof fileChunksVectorColumnIsNativeVector === "boolean") {
+    return fileChunksVectorColumnIsNativeVector;
+  }
+
+  const db = getDbIfInitialized();
+  if (!db) {
+    fileChunksVectorColumnIsNativeVector = false;
+    return false;
+  }
+
+  try {
+    const rows = await db.execute<{ udt_name: string }>(sql`
+      SELECT udt_name
+      FROM information_schema.columns
+      WHERE table_name = 'file_chunks' AND column_name = 'embedding_vector'
+      LIMIT 1
+    `);
+
+    const row = Array.from(rows as unknown as Array<{ udt_name?: string }>)[0];
+    fileChunksVectorColumnIsNativeVector = row?.udt_name === "vector";
+  } catch {
+    fileChunksVectorColumnIsNativeVector = false;
+  }
+
+  return fileChunksVectorColumnIsNativeVector;
+}
+
+function toBatches<T>(input: T[], batchSize: number): T[][] {
+  const batches: T[][] = [];
+  for (let index = 0; index < input.length; index += batchSize) {
+    batches.push(input.slice(index, index + batchSize));
+  }
+  return batches;
+}
+
 const chunksByProject = new Map<string, Array<{
   id: UUID;
   projectId: UUID;
@@ -31,6 +70,11 @@ const chunksByProject = new Map<string, Array<{
   fileName: string;
   chunkIndex: number;
   chunkText: string;
+  sourceType: "content" | "summary" | "metadata_stub";
+  pageNumber?: number;
+  sectionLabel?: string;
+  metadata?: Record<string, unknown>;
+  confidence?: number;
   tokenCount: number;
   embeddingModel: string;
   embedding: number[];
@@ -88,17 +132,29 @@ function toFileRecord(record: {
   summary: string | null;
   keyTopics: string[] | null;
   tags: string[] | null;
-  docCategory: "submittal" | "spec" | "drawing" | "rfi" | "photo" | "report" | null;
+  docCategory: string | null;
   specSection: string | null;
   sheetNumber: string | null;
   revision: string | null;
+  processingMode: "full" | "reduced" | "metadata_only";
+  processingReason: string | null;
+  reducedCoverage: boolean;
+  extractedContentPercent: number | null;
+  normalizedTextObjectKey: string | null;
+  normalizedTextChecksum: string | null;
+  normalizedTextLength: number | null;
+  normalizedTextStoredAt: Date | null;
+  encryptionKeyVersion: number | null;
   onedriveEtag: string | null;
+  versionHash: string | null;
   lastSynced: Date | null;
   indexStatus: "pending" | "processing" | "indexed" | "failed";
   lastIndexed: Date | null;
   chunkCount: number;
   createdAt: Date;
   updatedAt: Date;
+  extractedFields?: unknown;
+  priorityScore?: number | null;
 }): FileRecord {
   return {
     id: toUuid(record.id),
@@ -112,17 +168,29 @@ function toFileRecord(record: {
     summary: record.summary ?? undefined,
     keyTopics: record.keyTopics ?? undefined,
     tags: record.tags ?? undefined,
-    docCategory: record.docCategory ?? undefined,
+    docCategory: (record.docCategory ?? undefined) as import("@contractor/shared").DocumentCategory | undefined,
     specSection: record.specSection ?? undefined,
     sheetNumber: record.sheetNumber ?? undefined,
     revision: record.revision ?? undefined,
+    processingMode: record.processingMode,
+    processingReason: record.processingReason ?? undefined,
+    reducedCoverage: record.reducedCoverage,
+    extractedContentPercent: record.extractedContentPercent ?? undefined,
+    normalizedTextObjectKey: record.normalizedTextObjectKey ?? undefined,
+    normalizedTextChecksum: record.normalizedTextChecksum ?? undefined,
+    normalizedTextLength: record.normalizedTextLength ?? undefined,
+    normalizedTextStoredAt: record.normalizedTextStoredAt ?? undefined,
+    encryptionKeyVersion: record.encryptionKeyVersion ?? undefined,
     onedriveEtag: record.onedriveEtag ?? undefined,
+    versionHash: record.versionHash ?? undefined,
     lastSynced: record.lastSynced ?? undefined,
     indexStatus: record.indexStatus,
     lastIndexed: record.lastIndexed ?? undefined,
     chunkCount: record.chunkCount,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
+    extractedFields: record.extractedFields as Record<string, string | undefined> | undefined,
+    priorityScore: record.priorityScore ?? undefined,
   };
 }
 
@@ -195,6 +263,66 @@ export const projectService = {
     getProjectsForOrg(resolvedOrgId).push(project);
 
     return { project };
+  },
+
+  async updateProjectFolderBinding(
+    projectId: UUID,
+    onedriveFolderId: string,
+    options?: {
+      clearIndexedData?: boolean;
+    }
+  ): Promise<CreateProjectResponse["project"]> {
+    const db = getDbIfInitialized();
+    const clearIndexedData = options?.clearIndexedData === true;
+
+    if (db) {
+      const [updated] = await db
+        .update(projects)
+        .set({
+          onedriveFolderId,
+        })
+        .where(eq(projects.id, projectId))
+        .returning();
+
+      if (!updated) {
+        throw new AppError(404, "project_not_found", "Project not found");
+      }
+
+      if (clearIndexedData) {
+        await this.setProjectFiles(projectId, []);
+        await db.delete(syncRuns).where(eq(syncRuns.projectId, projectId));
+        syncTimesByProject.delete(projectId);
+      }
+
+      return toProjectResponseProject(updated);
+    }
+
+    const allProjects = Array.from(projectsByOrg.values());
+    let updatedProject: CreateProjectResponse["project"] | undefined;
+
+    for (const orgProjects of allProjects) {
+      const project = orgProjects.find((entry) => entry.id === projectId);
+      if (!project) {
+        continue;
+      }
+
+      project.onedriveFolderId = onedriveFolderId;
+      updatedProject = project;
+      break;
+    }
+
+    if (!updatedProject) {
+      throw new AppError(404, "project_not_found", "Project not found");
+    }
+
+    if (clearIndexedData) {
+      filesByProject.set(projectId, []);
+      chunksByProject.set(projectId, []);
+      chunkLinksByProject.set(projectId, []);
+      syncTimesByProject.delete(projectId);
+    }
+
+    return updatedProject;
   },
 
   async getProjectDetails(projectId: UUID): Promise<ProjectDetailsResponse> {
@@ -329,7 +457,33 @@ export const projectService = {
             specSection: isUnchanged ? existing?.specSection : file.specSection,
             sheetNumber: isUnchanged ? existing?.sheetNumber : file.sheetNumber,
             revision: isUnchanged ? existing?.revision : file.revision,
+            processingMode: isUnchanged
+              ? existing?.processingMode ?? file.processingMode ?? "full"
+              : file.processingMode ?? "full",
+            processingReason: isUnchanged ? existing?.processingReason : file.processingReason,
+            reducedCoverage: isUnchanged
+              ? existing?.reducedCoverage ?? file.reducedCoverage ?? false
+              : file.reducedCoverage ?? false,
+            extractedContentPercent: isUnchanged
+              ? existing?.extractedContentPercent ?? file.extractedContentPercent
+              : file.extractedContentPercent,
+            normalizedTextObjectKey: isUnchanged
+              ? existing?.normalizedTextObjectKey ?? file.normalizedTextObjectKey
+              : file.normalizedTextObjectKey,
+            normalizedTextChecksum: isUnchanged
+              ? existing?.normalizedTextChecksum ?? file.normalizedTextChecksum
+              : file.normalizedTextChecksum,
+            normalizedTextLength: isUnchanged
+              ? existing?.normalizedTextLength ?? file.normalizedTextLength
+              : file.normalizedTextLength,
+            normalizedTextStoredAt: isUnchanged
+              ? existing?.normalizedTextStoredAt ?? file.normalizedTextStoredAt
+              : file.normalizedTextStoredAt,
+            encryptionKeyVersion: isUnchanged
+              ? existing?.encryptionKeyVersion ?? file.encryptionKeyVersion
+              : file.encryptionKeyVersion,
             onedriveEtag: file.onedriveEtag,
+            versionHash: file.versionHash,
             lastSynced: file.lastSynced,
             indexStatus: isUnchanged ? existing?.indexStatus ?? file.indexStatus : file.indexStatus,
             lastIndexed: isUnchanged ? existing?.lastIndexed : file.lastIndexed,
@@ -353,7 +507,33 @@ export const projectService = {
               specSection: isUnchanged ? existing?.specSection : file.specSection,
               sheetNumber: isUnchanged ? existing?.sheetNumber : file.sheetNumber,
               revision: isUnchanged ? existing?.revision : file.revision,
+              processingMode: isUnchanged
+                ? existing?.processingMode ?? file.processingMode ?? "full"
+                : file.processingMode ?? "full",
+              processingReason: isUnchanged ? existing?.processingReason : file.processingReason,
+              reducedCoverage: isUnchanged
+                ? existing?.reducedCoverage ?? file.reducedCoverage ?? false
+                : file.reducedCoverage ?? false,
+              extractedContentPercent: isUnchanged
+                ? existing?.extractedContentPercent ?? file.extractedContentPercent
+                : file.extractedContentPercent,
+              normalizedTextObjectKey: isUnchanged
+                ? existing?.normalizedTextObjectKey ?? file.normalizedTextObjectKey
+                : file.normalizedTextObjectKey,
+              normalizedTextChecksum: isUnchanged
+                ? existing?.normalizedTextChecksum ?? file.normalizedTextChecksum
+                : file.normalizedTextChecksum,
+              normalizedTextLength: isUnchanged
+                ? existing?.normalizedTextLength ?? file.normalizedTextLength
+                : file.normalizedTextLength,
+              normalizedTextStoredAt: isUnchanged
+                ? existing?.normalizedTextStoredAt ?? file.normalizedTextStoredAt
+                : file.normalizedTextStoredAt,
+              encryptionKeyVersion: isUnchanged
+                ? existing?.encryptionKeyVersion ?? file.encryptionKeyVersion
+                : file.encryptionKeyVersion,
               onedriveEtag: file.onedriveEtag,
+              versionHash: file.versionHash,
               lastSynced: file.lastSynced,
               indexStatus: isUnchanged ? existing?.indexStatus ?? file.indexStatus : file.indexStatus,
               lastIndexed: isUnchanged ? existing?.lastIndexed : file.lastIndexed,
@@ -369,19 +549,96 @@ export const projectService = {
           (entry) => Boolean(entry.onedriveItemId) && !syncedItemIds.includes(entry.onedriveItemId as string)
         );
         if (staleRecords.length > 0) {
-          await db
-            .delete(fileRecords)
-            .where(
-              and(
-                eq(fileRecords.projectId, projectId),
-                inArray(
-                  fileRecords.onedriveItemId,
-                  staleRecords.map((entry) => entry.onedriveItemId as string)
+          const staleFileIds = staleRecords.map((entry) => entry.id);
+          const staleChunkIds: string[] = [];
+          for (const fileIdBatch of toBatches(staleFileIds, IN_CLAUSE_BATCH_SIZE)) {
+            const staleChunkRows = await db
+              .select({ id: fileChunks.id })
+              .from(fileChunks)
+              .where(
+                and(
+                  eq(fileChunks.projectId, projectId),
+                  inArray(fileChunks.fileId, fileIdBatch)
                 )
-              )
-            );
+              );
+            staleChunkIds.push(...staleChunkRows.map((entry) => entry.id));
+          }
+
+          if (staleChunkIds.length > 0) {
+            for (const chunkIdBatch of toBatches(staleChunkIds, IN_CLAUSE_BATCH_SIZE)) {
+              await db
+                .delete(chunkLinks)
+                .where(
+                  and(
+                    eq(chunkLinks.projectId, projectId),
+                    inArray(chunkLinks.sourceChunkId, chunkIdBatch)
+                  )
+                );
+
+              await db
+                .delete(chunkLinks)
+                .where(
+                  and(
+                    eq(chunkLinks.projectId, projectId),
+                    inArray(chunkLinks.targetChunkId, chunkIdBatch)
+                  )
+                );
+            }
+          }
+
+          for (const fileIdBatch of toBatches(staleFileIds, IN_CLAUSE_BATCH_SIZE)) {
+            await db
+              .delete(fileChunks)
+              .where(
+                and(
+                  eq(fileChunks.projectId, projectId),
+                  inArray(fileChunks.fileId, fileIdBatch)
+                )
+              );
+          }
+
+          const staleItemIds = staleRecords.map((entry) => entry.onedriveItemId as string);
+          for (const itemIdBatch of toBatches(staleItemIds, IN_CLAUSE_BATCH_SIZE)) {
+            await db
+              .delete(fileRecords)
+              .where(
+                and(
+                  eq(fileRecords.projectId, projectId),
+                  inArray(fileRecords.onedriveItemId, itemIdBatch)
+                )
+              );
+          }
         }
       } else {
+        const existingChunkRows = await db
+          .select({ id: fileChunks.id })
+          .from(fileChunks)
+          .where(eq(fileChunks.projectId, projectId));
+        const existingChunkIds = existingChunkRows.map((entry) => entry.id);
+
+        if (existingChunkIds.length > 0) {
+          for (const chunkIdBatch of toBatches(existingChunkIds, IN_CLAUSE_BATCH_SIZE)) {
+            await db
+              .delete(chunkLinks)
+              .where(
+                and(
+                  eq(chunkLinks.projectId, projectId),
+                  inArray(chunkLinks.sourceChunkId, chunkIdBatch)
+                )
+              );
+
+            await db
+              .delete(chunkLinks)
+              .where(
+                and(
+                  eq(chunkLinks.projectId, projectId),
+                  inArray(chunkLinks.targetChunkId, chunkIdBatch)
+                )
+              );
+          }
+        }
+
+        await db.delete(fileChunks).where(eq(fileChunks.projectId, projectId));
         await db.delete(fileRecords).where(eq(fileRecords.projectId, projectId));
       }
 
@@ -401,6 +658,21 @@ export const projectService = {
       keyTopics?: string[];
       chunkCount?: number;
       lastIndexed?: Date;
+      docCategory?: string;
+      tags?: string[];
+      extractedFields?: Record<string, unknown>;
+      specSection?: string;
+      sheetNumber?: string;
+      revision?: string;
+      processingMode?: "full" | "reduced" | "metadata_only";
+      processingReason?: string;
+      reducedCoverage?: boolean;
+      extractedContentPercent?: number;
+      normalizedTextObjectKey?: string;
+      normalizedTextChecksum?: string;
+      normalizedTextLength?: number;
+      normalizedTextStoredAt?: Date;
+      encryptionKeyVersion?: number;
     }
   ): Promise<void> {
     const db = getDbIfInitialized();
@@ -413,6 +685,21 @@ export const projectService = {
           keyTopics: update.keyTopics,
           chunkCount: update.chunkCount,
           lastIndexed: update.lastIndexed,
+          docCategory: update.docCategory,
+          tags: update.tags,
+          extractedFields: update.extractedFields,
+          specSection: update.specSection,
+          sheetNumber: update.sheetNumber,
+          revision: update.revision,
+          processingMode: update.processingMode,
+          processingReason: update.processingReason,
+          reducedCoverage: update.reducedCoverage,
+          extractedContentPercent: update.extractedContentPercent,
+          normalizedTextObjectKey: update.normalizedTextObjectKey,
+          normalizedTextChecksum: update.normalizedTextChecksum,
+          normalizedTextLength: update.normalizedTextLength,
+          normalizedTextStoredAt: update.normalizedTextStoredAt,
+          encryptionKeyVersion: update.encryptionKeyVersion,
           updatedAt: new Date(),
         })
         .where(
@@ -433,6 +720,21 @@ export const projectService = {
     file.indexStatus = update.indexStatus;
     file.summary = update.summary;
     file.keyTopics = update.keyTopics;
+    file.docCategory = (update.docCategory as import("@contractor/shared").DocumentCategory | undefined) ?? file.docCategory;
+    file.tags = update.tags;
+    file.extractedFields = update.extractedFields as Record<string, string | undefined> | undefined;
+    file.specSection = update.specSection;
+    file.sheetNumber = update.sheetNumber;
+    file.revision = update.revision;
+    file.processingMode = update.processingMode ?? file.processingMode;
+    file.processingReason = update.processingReason;
+    file.reducedCoverage = update.reducedCoverage ?? file.reducedCoverage;
+    file.extractedContentPercent = update.extractedContentPercent ?? file.extractedContentPercent;
+    file.normalizedTextObjectKey = update.normalizedTextObjectKey ?? file.normalizedTextObjectKey;
+    file.normalizedTextChecksum = update.normalizedTextChecksum ?? file.normalizedTextChecksum;
+    file.normalizedTextLength = update.normalizedTextLength ?? file.normalizedTextLength;
+    file.normalizedTextStoredAt = update.normalizedTextStoredAt ?? file.normalizedTextStoredAt;
+    file.encryptionKeyVersion = update.encryptionKeyVersion ?? file.encryptionKeyVersion;
     file.chunkCount = update.chunkCount ?? file.chunkCount;
     file.lastIndexed = update.lastIndexed;
     file.updatedAt = new Date();
@@ -449,6 +751,11 @@ export const projectService = {
       tokenCount: number;
       embeddingModel: string;
       embedding: number[];
+      sourceType?: "content" | "summary" | "metadata_stub";
+      pageNumber?: number;
+      sectionLabel?: string;
+      metadata?: Record<string, unknown>;
+      confidence?: number;
     }>,
     links: Array<{
       sourceChunkIndex: number;
@@ -496,6 +803,7 @@ export const projectService = {
         id: UUID;
         chunkIndex: number;
       }> = [];
+      const writeVectorColumn = await shouldWriteEmbeddingVector();
 
       for (const chunk of chunks) {
         const [created] = await db
@@ -508,9 +816,14 @@ export const projectService = {
             fileName,
             chunkIndex: chunk.chunkIndex,
             chunkText: chunk.chunkText,
+            sourceType: chunk.sourceType ?? "content",
+            pageNumber: chunk.pageNumber,
+            sectionLabel: chunk.sectionLabel,
+            metadata: chunk.metadata ?? {},
             tokenCount: chunk.tokenCount,
             embeddingModel: chunk.embeddingModel,
             embedding: chunk.embedding,
+            embeddingVector: writeVectorColumn ? chunk.embedding : undefined,
             createdAt: new Date(),
           })
           .returning({
@@ -559,6 +872,11 @@ export const projectService = {
       fileName,
       chunkIndex: chunk.chunkIndex,
       chunkText: chunk.chunkText,
+      sourceType: chunk.sourceType ?? "content",
+      pageNumber: chunk.pageNumber,
+      sectionLabel: chunk.sectionLabel,
+      metadata: chunk.metadata ?? {},
+      confidence: chunk.confidence,
       tokenCount: chunk.tokenCount,
       embeddingModel: chunk.embeddingModel,
       embedding: chunk.embedding,
@@ -609,9 +927,15 @@ export const projectService = {
     fileName: string;
     chunkIndex: number;
     chunkText: string;
+    sourceType: "content" | "summary" | "metadata_stub";
+    pageNumber?: number;
+    sectionLabel?: string;
+    metadata?: Record<string, unknown>;
     tokenCount: number;
     embeddingModel: string;
     embedding: number[];
+    docCategory?: string;
+    tags?: string[];
   }>> {
     const db = getDbIfInitialized();
     if (db) {
@@ -627,6 +951,10 @@ export const projectService = {
         fileName: row.fileName,
         chunkIndex: row.chunkIndex,
         chunkText: row.chunkText,
+        sourceType: row.sourceType,
+        pageNumber: row.pageNumber ?? undefined,
+        sectionLabel: row.sectionLabel ?? undefined,
+        metadata: (row.metadata as Record<string, unknown> | null) ?? undefined,
         tokenCount: row.tokenCount,
         embeddingModel: row.embeddingModel,
         embedding: Array.isArray(row.embedding) ? (row.embedding as number[]) : [],
@@ -641,6 +969,10 @@ export const projectService = {
       fileName: row.fileName,
       chunkIndex: row.chunkIndex,
       chunkText: row.chunkText,
+      sourceType: row.sourceType,
+      pageNumber: row.pageNumber,
+      sectionLabel: row.sectionLabel,
+      metadata: row.metadata,
       tokenCount: row.tokenCount,
       embeddingModel: row.embeddingModel,
       embedding: row.embedding,
@@ -770,6 +1102,27 @@ export const projectService = {
       pageSize,
       hasMore: startIndex + files.length < filtered.length,
     };
+  },
+
+  async getProjectFileById(projectId: UUID, fileId: UUID): Promise<FileRecord | null> {
+    const db = getDbIfInitialized();
+    if (db) {
+      const [record] = await db
+        .select()
+        .from(fileRecords)
+        .where(
+          and(
+            eq(fileRecords.projectId, projectId),
+            eq(fileRecords.id, fileId)
+          )
+        )
+        .limit(1);
+
+      return record ? toFileRecord(record) : null;
+    }
+
+    const records = filesByProject.get(projectId) ?? [];
+    return records.find((file) => file.id === fileId) ?? null;
   },
 
   resetForTests(): void {

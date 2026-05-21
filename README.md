@@ -7,7 +7,7 @@ A construction document management and AI chat platform for contractors. The cur
 - **Mobile** (iOS + Android): React Native via Expo
 - **Web**: Next.js 14 with App Router
 - **Shared Logic**: TypeScript packages for API client, hooks, types, and state
-- **Backend**: Node.js + Express, PostgreSQL, Pinecone vectors, Redis queue
+- **Backend**: Node.js + Express, PostgreSQL + pgvector, Redis queue
 - **Indexing**: OneDrive → document extraction → LLM classification → embeddings → RAG chat
 
 ## Project Structure
@@ -67,10 +67,10 @@ contractor-ai/
 | **Backend** | Node.js + Express | Same language, good integrations |
 | **Auth** | Microsoft OAuth2 (MSAL) | Contractors already have M365 |
 | **Database** | PostgreSQL | Relational + JSONB for metadata |
-| **Vectors** | Pinecone | Simple vector search at scale |
+| **Vectors** | PostgreSQL + pgvector | Co-located vector search with project metadata |
 | **Queue** | Redis + BullMQ | Reliable document indexing pipeline |
-| **Chat** | Claude Sonnet | Strong document comprehension |
-| **Classification** | Claude Haiku | Fast + cheap tagging |
+| **Chat** | OpenAI Chat API | Grounded project Q&A and drafting |
+| **Classification** | OpenAI + rules | Construction-aware tagging and field extraction |
 
 ## Getting Started
 
@@ -117,6 +117,12 @@ API_BASE_URL=http://localhost:3001
 # Backend dependencies
 DATABASE_URL=postgresql://user:password@localhost:5432/contractor_ai
 REDIS_URL=redis://localhost:6379
+GEMINI_API_KEY=your-gemini-api-key
+GEMINI_CHAT_MODEL=gemini-2.5-flash
+GEMINI_CHAT_ENDPOINT=https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
+OPENAI_API_KEY=your-openai-api-key
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+OPENAI_EMBEDDING_ENDPOINT=https://api.openai.com/v1/embeddings
 
 # Microsoft OAuth
 MICROSOFT_CLIENT_ID=your-client-id-here
@@ -200,13 +206,27 @@ See the full plan: [Contractor MVP Plan](./CONTRACTOR_MVP_PLAN.md) (coming soon)
 - Smart folder browser (mobile + web)
 
 ✅ **Document Indexing**
-- Auto-extract text from PDFs, DOCX, images
+- Auto-extract text from PDFs, DOCX, XLSX/CSV, TXT/MD, and email formats
+- Store provenance per chunk (source type, page, section label, metadata)
+- Use metadata stubs for non-text drawing/image files in v1 (no OCR body text yet)
 - LLM-powered classification (category, spec section, tags, summary)
-- Chunking + embedding → Pinecone
+- Chunking + embedding → pgvector-backed retrieval
+- Embedding path is fail-closed for reliability: if provider preflight fails, indexing pauses and leaves files pending rather than mass-failing
+- Diagnostics include grouped failure reasons (stage + error code), pause/circuit state, and indexing anomalies
+
+### Indexing Reliability Notes
+
+- Before processing files, embedding provider preflight is executed. If it fails (for example invalid API key or provider outage), project indexing is paused with an actionable reason.
+- Repeated fatal embedding failures open a short circuit-breaker cooldown. During cooldown, additional files remain pending instead of being marked failed.
+- Indexing progress diagnostics now expose:
+	- `paused`, `pauseReasonCode`, `pauseMessage`
+	- `circuitOpen`
+	- `groupedFailureReasons`
+	- `anomalies`
 
 ✅ **AI Chat with RAG**
-- Hybrid search (metadata filters + vector similarity)
-- Source citations with file links
+- Hybrid search with source-type gating (content/summary/metadata-stub)
+- Validated evidence citations with chunk/page/section hints
 - Stream responses in real-time
 
 ✅ **Native Mobile**
@@ -248,6 +268,28 @@ pnpm -F @contractor/shared build
 3. Run tests: `pnpm test`
 4. Create a PR to `main`
 5. Merge after review
+
+### Canary Rollback Switches
+
+Use these environment toggles to disable rollout paths immediately:
+
+```bash
+# Disable extractor v2 shadow pipeline
+INDEXING_EXTRACTOR_PIPELINE_V2_ENABLED=false
+
+# Disable hybrid retrieval (vector + FTS blend)
+RETRIEVAL_HYBRID_ENABLED=false
+
+# Disable optional reranker stage
+RETRIEVAL_RERANK_ENABLED=false
+```
+
+Project-scoped canary targeting:
+
+```bash
+# Comma-separated project IDs allowed to receive enabled rollouts
+CANARY_PROJECT_IDS=<project-id-1>,<project-id-2>
+```
 
 ## Contributing
 

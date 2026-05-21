@@ -133,6 +133,81 @@ describe("backend server", () => {
     ]);
   });
 
+  it("updates project folder binding and supports reset flag", async () => {
+    vi.stubEnv("MICROSOFT_CLIENT_ID", "test-client");
+    vi.stubEnv("MICROSOFT_CLIENT_SECRET", "test-secret");
+    resetEnvCache();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          access_token: "microsoft-access-token",
+          refresh_token: "microsoft-refresh-token",
+          id_token: [
+            "header",
+            Buffer.from(
+              JSON.stringify({
+                oid: "user-123",
+                tid: "tenant-123",
+                name: "Jane Contractor",
+                preferred_username: "jane@contractor.ai",
+              })
+            ).toString("base64url"),
+            "signature",
+          ].join("."),
+          expires_in: 3600,
+          token_type: "Bearer",
+          scope: "openid profile email",
+        }),
+      })
+    );
+
+    const app = await createApp();
+    const redirectUri = "http://localhost:3000/auth/callback";
+    const start = await request(app)
+      .get("/api/auth/login")
+      .query({ redirectUri });
+    const authorizationUrl = new URL(start.headers.location, "https://login.microsoftonline.com");
+    const state = authorizationUrl.searchParams.get("state");
+
+    const login = await request(app)
+      .post("/api/auth/login")
+      .send({ code: "oauth-code", redirectUri, state });
+
+    const createResponse = await request(app)
+      .post("/api/projects")
+      .set("Authorization", `Bearer ${login.body.accessToken}`)
+      .send({
+        name: "Folder Switch Project",
+        onedriveFolderId: "old-folder",
+      });
+
+    const updateResponse = await request(app)
+      .patch(`/api/projects/${createResponse.body.project.id}`)
+      .set("Authorization", `Bearer ${login.body.accessToken}`)
+      .send({
+        onedriveFolderId: "new-folder",
+        resetIndexedData: true,
+      });
+
+    expect(updateResponse.status).toBe(200);
+    expect(updateResponse.body.project.onedriveFolderId).toBe("new-folder");
+    expect(updateResponse.body.resetPerformed).toBe(true);
+
+    const listResponse = await request(app)
+      .get("/api/projects")
+      .set("Authorization", `Bearer ${login.body.accessToken}`);
+
+    expect(listResponse.status).toBe(200);
+    expect(listResponse.body.projects).toEqual([
+      expect.objectContaining({
+        id: createResponse.body.project.id,
+        onedriveFolderId: "new-folder",
+      }),
+    ]);
+  });
+
   it("exchanges an OAuth code for a backend session token", async () => {
     vi.stubEnv("MICROSOFT_CLIENT_ID", "test-client");
     vi.stubEnv("MICROSOFT_CLIENT_SECRET", "test-secret");
@@ -405,8 +480,8 @@ describe("backend server", () => {
     expect(sync.status).toBe(200);
     expect(sync.body.syncStarted).toBe(true);
     expect(sync.body.scannedFileCount).toBe(3);
-    expect(sync.body.supportedFileCount).toBe(2);
-    expect(sync.body.unsupportedFileCount).toBe(1);
+    expect(sync.body.supportedFileCount).toBe(3);
+    expect(sync.body.unsupportedFileCount).toBe(0);
 
     const files = await request(app)
       .get(`/api/projects/${project.body.project.id}/files`)
@@ -419,7 +494,7 @@ describe("backend server", () => {
       expect.arrayContaining([
         expect.objectContaining({ fileName: "spec.pdf", indexStatus: "pending" }),
         expect.objectContaining({ fileName: "rfi.docx", indexStatus: "pending" }),
-        expect.objectContaining({ fileName: "notes.txt", indexStatus: "failed" }),
+        expect.objectContaining({ fileName: "notes.txt", indexStatus: "pending" }),
       ])
     );
 
@@ -431,11 +506,12 @@ describe("backend server", () => {
     expect(progress.body).toEqual(
       expect.objectContaining({
         total: 3,
-        pending: 2,
+        pending: 3,
         processing: 0,
         indexed: 0,
-        failed: 1,
-        completionPercent: 33,
+        failed: 0,
+        paused: true,
+        completionPercent: 0,
       })
     );
   });

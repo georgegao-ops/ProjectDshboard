@@ -91,6 +91,36 @@
   margin-top: 10px;
 }
 
+.folder-dropdown-panel {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.folder-dropdown-panel h4 {
+  margin: 0 0 8px;
+}
+
+.folder-dropdown-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.folder-dropdown-actions select {
+  border: 1px solid #d8dbe2;
+  border-radius: 6px;
+  padding: 10px 12px;
+  font: inherit;
+  background: #fff;
+}
+
+.folder-dropdown-actions select:focus {
+  outline: 2px solid #b4d4ff;
+  border-color: #007bff;
+}
+
 .feature-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -172,7 +202,21 @@
   font: inherit;
 }
 
+.chat-textarea {
+  border: 1px solid #d8dbe2;
+  border-radius: 6px;
+  padding: 10px 12px;
+  font: inherit;
+  min-height: 96px;
+  resize: vertical;
+}
+
 .project-form input:focus {
+  outline: 2px solid #b4d4ff;
+  border-color: #007bff;
+}
+
+.chat-textarea:focus {
   outline: 2px solid #b4d4ff;
   border-color: #007bff;
 }
@@ -313,6 +357,16 @@
 
 .diagnostics-panel h4 {
   margin: 0;
+}
+
+.ai-chat-panel {
+  margin-top: 18px;
+}
+
+.chat-answer {
+  margin-top: 10px;
+  white-space: pre-wrap;
+  line-height: 1.45;
 }
 
 .diagnostics-actions {

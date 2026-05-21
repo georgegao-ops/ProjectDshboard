@@ -1,0 +1,13 @@
+[
+  {
+    "id": "expansion-joint-volume-5",
+    "projectId": "26119b35-a446-4b58-bc4a-de07e133fbb1",
+    "query": "based off the volume 5 conformed prdc, what are the expansion joint specifications",
+    "topK": 12,
+    "expected": {
+      "fileId": "a67b41a8-7eab-49ad-a4b2-f2874b6be544",
+      "fileNameIncludes": "volume_05",
+      "requiredTerms": ["expansion", "joint"]
+    }
+  }
+]

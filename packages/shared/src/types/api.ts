@@ -116,6 +116,18 @@ export interface CreateProjectResponse {
   project: Project;
 }
 
+export interface UpdateProjectFolderRequest {
+  onedriveFolderId: string;
+  resetIndexedData?: boolean;
+}
+
+export interface UpdateProjectFolderResponse {
+  project: Project;
+  resetPerformed: boolean;
+  sync: OneDriveSyncResponse;
+  message: string;
+}
+
 export interface ProjectDetailsResponse {
   project: Project;
   onedrive: OneDriveStatus;
@@ -140,6 +152,51 @@ export interface ProjectFilesResponse {
   hasMore: boolean;
 }
 
+export interface GroupedIndexingFailureReason {
+  stage: string;
+  errorCode: string;
+  count: number;
+  lastMessage: string;
+  lastSeenAt: string;
+}
+
+export interface IndexingAnomaly {
+  type: string;
+  count: number;
+  message: string;
+}
+
+export interface IndexingRecentError {
+  fileName: string;
+  stage: string;
+  errorCode: string;
+  errorMessage: string;
+  createdAt: string;
+}
+
+export interface ProjectIndexingProgressResponse {
+  total: number;
+  processableTotal: number;
+  pending: number;
+  processing: number;
+  indexed: number;
+  failed: number;
+  skipped: number;
+  unsupportedCount: number;
+  oversizeCount: number;
+  completionPercent: number;
+  paused: boolean;
+  pauseReasonCode?: string;
+  pauseMessage?: string;
+  pauseSince?: string;
+  pauseUntil?: string;
+  circuitOpen: boolean;
+  categoryBreakdown: Record<string, number>;
+  recentErrors: IndexingRecentError[];
+  groupedFailureReasons: GroupedIndexingFailureReason[];
+  anomalies: IndexingAnomaly[];
+}
+
 // ================================
 // CHAT
 // ================================
@@ -156,20 +213,121 @@ export interface ChatSessionsListResponse {
   sessions: ChatSession[];
 }
 
+export interface ChatHistoryTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface OpenDocContext {
+  fileName: string;
+  fileId?: UUID;
+  page?: number;
+}
+
+export type ChatIntentLabel =
+  | "greeting"
+  | "file_lookup"
+  | "active_doc_qa"
+  | "status_check"
+  | "schedule_risk"
+  | "cost_risk"
+  | "contract_notice"
+  | "document_summary"
+  | "general_qa";
+
+export interface ChatInterpretation {
+  intent: ChatIntentLabel;
+  confidence: number;
+  source: "rules" | "llm" | "fallback";
+  alternatives?: Array<{
+    intent: ChatIntentLabel;
+    confidence: number;
+  }>;
+  entities?: {
+    rfiNumber?: string;
+    submittalNumber?: string;
+    specSection?: string;
+    dateHint?: "recent" | "latest";
+    statusHint?: "open" | "pending" | "closed";
+  };
+  retrievalHints?: {
+    preferredCategories?: string[];
+    preferredTags?: string[];
+    recencyBias?: boolean;
+  };
+  fallbackReason?: string;
+}
+
+export interface InterpretationFeedbackEvent {
+  verdict: "accepted" | "corrected" | "irrelevant";
+  correctedIntent?: ChatIntentLabel;
+  note?: string;
+}
+
 export interface SendChatMessageRequest {
   sessionId: UUID;
   message: string;
+  history?: ChatHistoryTurn[];
+  openDocs?: OpenDocContext[];
+  activeDocFileName?: string;
+  activeDocFileId?: UUID;
+  feedback?: InterpretationFeedbackEvent;
 }
 
 export interface SendChatMessageResponse {
   messageId: UUID;
   role: "assistant";
   content: string;
+  interpretation?: ChatInterpretation;
+  suggestions?: string[];
+  autoOpenFileName?: string;
   sources: Array<{
     fileId: UUID;
     fileName: string;
+    displayName?: string;
     relevance: number;
+    suggestedPages?: number[];
+    bestPage?: number;
+    pageOrigin?: "exact" | "fallback" | "mixed";
   }>;
+  citations?: Array<{
+    chunkId: string;
+    fileId: UUID;
+    fileName: string;
+    chunkIndex: number;
+    sourceType: "content" | "summary" | "metadata_stub";
+    relevance: number;
+    pageNumber?: number;
+    sectionLabel?: string;
+    metadata?: Record<string, unknown>;
+    confidence: number;
+  }>;
+  coordinator?: {
+    domains: string[];
+    cacheHit: boolean;
+    splitSignals: string[];
+    specialistAgents: Array<{
+      agent: string;
+      domains: string[];
+      sourceCount: number;
+      nodeCount: number;
+      durationMs: number;
+    }>;
+    estimatedContextTokens: number;
+    contradictions: Array<{
+      kind: string;
+      severity: "info" | "warning";
+      message: string;
+      evidenceFileIds: UUID[];
+    }>;
+    telemetry: {
+      routeMs: number;
+      retrievalMs: number;
+      mergeMs: number;
+      agentMs: number;
+      totalMs: number;
+    };
+  };
   createdAt: Date;
 }
 

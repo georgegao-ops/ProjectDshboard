@@ -10,11 +10,13 @@ import dotenv from "dotenv";
 import { initializeDb } from "./db";
 import type {
   AuthLoginRequest,
+  ChatIntentLabel,
   CreateChatSessionRequest,
   CreateProjectRequest,
   OneDriveConnectRequest,
   OneDriveSyncRequest,
   SendChatMessageRequest,
+  UpdateProjectFolderRequest,
   UpdateProjectFeatureRequest,
 } from "@contractor/shared";
 import { getEnv, hasMicrosoftOAuthConfig } from "./config/env";
@@ -23,11 +25,13 @@ import { logger } from "./lib/logger";
 import {
   authService,
   chatService,
+  documentRelationshipService,
   featureService,
   healthService,
   indexingService,
   onedriveService,
   projectService,
+  retrievalService,
   startIndexingWorker,
   syncService,
 } from "./services";
@@ -112,6 +116,98 @@ function requireAuthenticatedRequest(
   next();
 }
 
+const ALLOWED_CHAT_INTENTS = new Set<ChatIntentLabel>([
+  "greeting",
+  "file_lookup",
+  "active_doc_qa",
+  "status_check",
+  "schedule_risk",
+  "cost_risk",
+  "contract_notice",
+  "document_summary",
+  "general_qa",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseSendChatMessageRequest(body: unknown): Omit<SendChatMessageRequest, "sessionId"> {
+  if (!isRecord(body)) {
+    throw new AppError(400, "invalid_request", "Request body must be an object");
+  }
+
+  const message = body.message;
+  if (typeof message !== "string" || message.trim().length === 0) {
+    throw new AppError(400, "invalid_message", "message is required");
+  }
+  if (message.length > 4000) {
+    throw new AppError(400, "invalid_message", "message must be 4000 characters or fewer");
+  }
+
+  const feedbackRaw = body.feedback;
+  let parsedFeedback: SendChatMessageRequest["feedback"];
+  if (feedbackRaw !== undefined) {
+    if (!isRecord(feedbackRaw)) {
+      throw new AppError(400, "invalid_feedback", "feedback must be an object");
+    }
+
+    const verdict = feedbackRaw.verdict;
+    if (verdict !== "accepted" && verdict !== "corrected" && verdict !== "irrelevant") {
+      throw new AppError(400, "invalid_feedback", "feedback.verdict is invalid");
+    }
+
+    const correctedIntent = feedbackRaw.correctedIntent;
+    if (correctedIntent !== undefined) {
+      if (typeof correctedIntent !== "string" || !ALLOWED_CHAT_INTENTS.has(correctedIntent as ChatIntentLabel)) {
+        throw new AppError(400, "invalid_feedback", "feedback.correctedIntent is invalid");
+      }
+    }
+
+    if (verdict === "corrected" && correctedIntent === undefined) {
+      throw new AppError(400, "invalid_feedback", "feedback.correctedIntent is required when verdict is corrected");
+    }
+
+    const note = feedbackRaw.note;
+    if (note !== undefined) {
+      if (typeof note !== "string") {
+        throw new AppError(400, "invalid_feedback", "feedback.note must be a string");
+      }
+      if (note.length > 1000) {
+        throw new AppError(400, "invalid_feedback", "feedback.note must be 1000 characters or fewer");
+      }
+    }
+
+    const parsedCorrectedIntent =
+      typeof correctedIntent === "string"
+        ? (correctedIntent as ChatIntentLabel)
+        : undefined;
+
+    parsedFeedback = {
+      verdict,
+      correctedIntent: parsedCorrectedIntent,
+      note: typeof note === "string" ? note : undefined,
+    };
+  }
+
+  return {
+    message,
+    history: Array.isArray(body.history)
+      ? (body.history as SendChatMessageRequest["history"])
+      : undefined,
+    openDocs: Array.isArray(body.openDocs)
+      ? (body.openDocs as SendChatMessageRequest["openDocs"])
+      : undefined,
+    activeDocFileName:
+      typeof body.activeDocFileName === "string" ? body.activeDocFileName : undefined,
+    activeDocFileId:
+      typeof body.activeDocFileId === "string"
+        ? (body.activeDocFileId as SendChatMessageRequest["activeDocFileId"])
+        : undefined,
+    feedback: parsedFeedback,
+  };
+}
+
 // ================================
 // ROUTE HANDLERS (Stubs for Phase 1)
 // ================================
@@ -166,8 +262,19 @@ const handleCreateChatSession = asyncHandler(async (req, res) => {
 });
 
 const handleSendChatMessage = asyncHandler(async (req, res) => {
-  const body = req.body as SendChatMessageRequest;
-  res.json(await chatService.sendMessage(toUuid(req.params.id), body.message));
+  const body = parseSendChatMessageRequest(req.body);
+  res.json(
+    await chatService.sendMessage(
+      toUuid(req.params.id),
+      body.message,
+      body.history,
+      body.openDocs,
+      body.activeDocFileName,
+      body.activeDocFileId,
+      body.feedback,
+      req.user
+    )
+  );
 });
 
 const handleGetProjectFeatures = asyncHandler(async (req, res) => {
@@ -298,6 +405,51 @@ async function createApp(): Promise<Express> {
   // Projects
   app.get("/api/projects", requireAuthenticatedRequest, handleGetProjects);
   app.post("/api/projects", requireAuthenticatedRequest, handleCreateProject);
+  app.patch("/api/projects/:id", requireAuthenticatedRequest, asyncHandler(async (req, res) => {
+    const projectId = toUuid(req.params.id);
+    await projectService.getProjectOrThrow(projectId, req.orgId);
+
+    const body = req.body as UpdateProjectFolderRequest;
+    const nextFolderId = body.onedriveFolderId?.trim();
+    if (!nextFolderId) {
+      throw new AppError(400, "invalid_folder", "onedriveFolderId is required");
+    }
+
+    const project = await projectService.updateProjectFolderBinding(projectId, nextFolderId, {
+      clearIndexedData: body.resetIndexedData === true,
+    });
+
+    // Reset any stale progress snapshot immediately so polling never sees old-folder data.
+    // inProgress:true avoids a false "idle" flash before the async sync begins.
+    syncService.resetProjectSyncProgress(
+      projectId,
+      "Project folder updated. Sync starting in background."
+    );
+
+    // Fire sync without awaiting — syncProjectMetadata can take minutes for large folders.
+    // Always handle rejections so an indexing startup failure cannot crash the process.
+    void syncService
+      .syncProjectMetadata(projectId, req.user, req.orgId)
+      .catch((error) => {
+        logger.error("projects.folder-update.sync-start.failed", error, {
+          requestId: req.requestId,
+          projectId,
+        });
+      });
+
+    res.json({
+      project,
+      resetPerformed: body.resetIndexedData === true,
+      sync: {
+        syncStarted: true,
+        message: "Sync started in background. Poll /sync/progress for updates.",
+      },
+      message:
+        body.resetIndexedData === true
+          ? "Project folder updated and previous indexed data cleared."
+          : "Project folder updated.",
+    });
+  }));
   app.get("/api/projects/:id", requireAuthenticatedRequest, asyncHandler(async (req, res) => {
     res.json(await projectService.getProjectDetails(toUuid(req.params.id)));
   }));
@@ -325,6 +477,31 @@ async function createApp(): Promise<Express> {
     });
     res.json(response);
   }));
+  app.get("/api/projects/:id/files/:fileId/content", requireAuthenticatedRequest, asyncHandler(async (req, res) => {
+    const projectId = toUuid(req.params.id);
+    const fileId = toUuid(req.params.fileId);
+
+    await projectService.getProjectOrThrow(projectId, req.orgId);
+
+    const file = await projectService.getProjectFileById(projectId, fileId);
+    if (!file) {
+      res.status(404).json({ error: "file_not_found", message: "Project file not found" });
+      return;
+    }
+
+    if (!file.onedriveItemId) {
+      res.status(400).json({ error: "file_source_missing", message: "File source identifier is missing" });
+      return;
+    }
+
+    const fileContent = await onedriveService.downloadFileContent(req.user, file.onedriveItemId);
+    const contentType = fileContent.contentType ?? file.mimeType ?? "application/octet-stream";
+    const safeName = file.fileName.replace(/\"/g, "");
+
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Content-Disposition", `inline; filename=\"${safeName}\"`);
+    res.send(fileContent.buffer);
+  }));
   app.get("/api/projects/:id/indexing/progress", requireAuthenticatedRequest, asyncHandler(async (req, res) => {
     const projectId = toUuid(req.params.id);
     await projectService.getProjectOrThrow(projectId, req.orgId);
@@ -344,17 +521,109 @@ async function createApp(): Promise<Express> {
     const projectId = toUuid(req.params.id);
     await projectService.getProjectOrThrow(projectId, req.orgId);
     const query = typeof req.query.q === "string" ? req.query.q : "";
-    res.json({ sources: await retrievalService.retrieveSources(projectId, query) });
+
+    const topK = typeof req.query.topK === "string" ? Number(req.query.topK) : undefined;
+    const minRelevance =
+      typeof req.query.minRelevance === "string" ? Number(req.query.minRelevance) : undefined;
+    const category = typeof req.query.category === "string" ? req.query.category : undefined;
+    const tags =
+      typeof req.query.tags === "string"
+        ? req.query.tags
+            .split(",")
+            .map((tag) => tag.trim())
+            .filter((tag) => tag.length > 0)
+        : undefined;
+
+    res.json({
+      sources: await retrievalService.retrieveSources(projectId, query, {
+        topK,
+        minRelevance,
+        category,
+        tags,
+      }),
+    });
+  }));
+
+  // ---- Indexing Branch: Context & Search API (consumed by AI Chat Branch) ----
+
+  // Semantic search: POST /api/projects/:id/search
+  // Body: { query, topK?, minRelevance?, category?, tags?, includeChunks? }
+  app.post("/api/projects/:id/search", requireAuthenticatedRequest, asyncHandler(async (req, res) => {
+    const projectId = toUuid(req.params.id);
+    await projectService.getProjectOrThrow(projectId, req.orgId);
+    const body = req.body as {
+      query?: string;
+      topK?: number;
+      minRelevance?: number;
+      category?: string;
+      tags?: string[];
+      includeChunks?: boolean;
+    };
+    if (!body.query?.trim()) {
+      res.status(400).json({ error: "query is required" });
+      return;
+    }
+    res.json(
+      await retrievalService.searchProject(projectId, body.query, {
+        topK: body.topK,
+        minRelevance: body.minRelevance,
+        category: body.category,
+        tags: body.tags,
+        includeChunks: body.includeChunks,
+      })
+    );
+  }));
+
+  // Project context snapshot: GET /api/projects/:id/context
+  app.get("/api/projects/:id/context", requireAuthenticatedRequest, asyncHandler(async (req, res) => {
+    const projectId = toUuid(req.params.id);
+    await projectService.getProjectOrThrow(projectId, req.orgId);
+    res.json(await retrievalService.getProjectContext(projectId));
+  }));
+
+  // Suggestions: GET /api/projects/:id/suggestions?q=optional_current_query
+  app.get("/api/projects/:id/suggestions", requireAuthenticatedRequest, asyncHandler(async (req, res) => {
+    const projectId = toUuid(req.params.id);
+    await projectService.getProjectOrThrow(projectId, req.orgId);
+    const currentQuery = typeof req.query.q === "string" ? req.query.q : undefined;
+    res.json({ suggestions: await retrievalService.getSuggestions(projectId, currentQuery) });
+  }));
+
+  // Document detail: GET /api/files/:fileId?projectId=...
+  app.get("/api/files/:fileId", requireAuthenticatedRequest, asyncHandler(async (req, res) => {
+    const fileId = toUuid(req.params.fileId);
+    const projectId = typeof req.query.projectId === "string"
+      ? toUuid(req.query.projectId)
+      : undefined;
+    if (!projectId) {
+      res.status(400).json({ error: "projectId query param is required" });
+      return;
+    }
+    await projectService.getProjectOrThrow(projectId, req.orgId);
+    const doc = await retrievalService.getDocumentDetail(fileId, projectId);
+    if (!doc) {
+      res.status(404).json({ error: "document_not_found" });
+      return;
+    }
+    res.json(doc);
+  }));
+
+  // Document relationships: POST /api/projects/:id/relationships/build
+  app.post("/api/projects/:id/relationships/build", requireAuthenticatedRequest, asyncHandler(async (req, res) => {
+    const projectId = toUuid(req.params.id);
+    await projectService.getProjectOrThrow(projectId, req.orgId);
+    const result = await documentRelationshipService.buildRelationships(projectId);
+    res.json(result);
   }));
 
   // Chat
   app.post("/api/chat/sessions", requireAuthenticatedRequest, handleCreateChatSession);
   app.get("/api/chat/sessions", requireAuthenticatedRequest, asyncHandler(async (_req, res) => {
-    res.json(await chatService.listSessions());
+    res.json(await chatService.listSessionsForUser(_req.user));
   }));
   app.post("/api/chat/sessions/:id/message", requireAuthenticatedRequest, handleSendChatMessage);
   app.get("/api/chat/sessions/:id/messages", requireAuthenticatedRequest, asyncHandler(async (req, res) => {
-    res.json(await chatService.getHistory(toUuid(req.params.id)));
+    res.json(await chatService.getHistoryForUser(toUuid(req.params.id), req.user));
   }));
 
   // Features
@@ -390,9 +659,10 @@ async function createApp(): Promise<Express> {
       return;
     }
 
+    const isProduction = process.env.NODE_ENV === "production";
     res.status(500).json({
       error: "internal_server_error",
-      message: "Internal Server Error",
+      message: isProduction ? "Internal Server Error" : err.message || "Internal Server Error",
       requestId: req.requestId,
     });
   });
@@ -403,6 +673,18 @@ async function createApp(): Promise<Express> {
 // ================================
 // SERVER START
 // ================================
+
+function formatListenError(error: NodeJS.ErrnoException, port: number): string {
+  if (error.code === "EADDRINUSE") {
+    return `Port ${port} is already in use. Stop the existing process or set a different PORT before starting the backend.`;
+  }
+
+  if (error.code === "EACCES") {
+    return `Insufficient permissions to bind to port ${port}.`;
+  }
+
+  return error.message || "Failed to bind backend server port.";
+}
 
 async function startServer() {
   try {
@@ -436,12 +718,36 @@ async function startServer() {
     // Create and start Express app
     const app = await createApp();
 
-    const server = app.listen(env.port, () => {
+    const server = app.listen(env.port);
+
+    server.once("listening", () => {
       logger.info("server.started", {
         port: env.port,
         baseUrl: env.apiBaseUrl,
         healthUrl: `${env.apiBaseUrl}/health`,
       });
+    });
+
+    server.once("error", (error: NodeJS.ErrnoException) => {
+      void (async () => {
+        logger.error("server.listen.failed", {
+          code: error.code,
+          port: env.port,
+          message: formatListenError(error, env.port),
+        });
+
+        if (indexingWorkerRuntime) {
+          try {
+            await indexingWorkerRuntime.close();
+          } catch (workerError) {
+            logger.warn("server.listen.failed.worker-close", {
+              message: workerError instanceof Error ? workerError.message : String(workerError),
+            });
+          }
+        }
+
+        process.exit(1);
+      })();
     });
 
     const shutdown = async (signal: NodeJS.Signals): Promise<void> => {

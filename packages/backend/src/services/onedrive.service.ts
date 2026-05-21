@@ -65,6 +65,11 @@ export interface DownloadedOneDriveFile {
   byteLength: number;
 }
 
+export interface OneDriveFileContent {
+  buffer: Buffer;
+  contentType?: string;
+}
+
 const connectionStates = new Map<
   string,
   { userId: string; redirectUri: string; createdAt: number }
@@ -643,6 +648,40 @@ export const onedriveService = {
       tempFilePath,
       originalName,
       byteLength: fileBuffer.length,
+    };
+  },
+
+  async downloadFileContent(
+    user: RequestUserContext | undefined,
+    itemId: string
+  ): Promise<OneDriveFileContent> {
+    const authenticatedUser = requireUser(user);
+    const connection = await getConnectionOrThrow(authenticatedUser);
+    const accessToken = await exchangeRefreshToken(connection);
+
+    const response = await fetch(
+      `${getGraphBaseUrl()}/me/drive/items/${encodeURIComponent(itemId)}/content`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      }
+    );
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new AppError(
+        502,
+        "onedrive_download_failed",
+        `OneDrive download failed: ${errorBody || response.statusText}`
+      );
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    return {
+      buffer: Buffer.from(arrayBuffer),
+      contentType: response.headers.get("content-type") ?? undefined,
     };
   },
 

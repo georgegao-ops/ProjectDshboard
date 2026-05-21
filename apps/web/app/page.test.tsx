@@ -4,9 +4,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Home from './page';
 
 const mockUseAuthStore = vi.fn();
+const mockPush = vi.fn();
 
 vi.mock('@contractor/shared', () => ({
   useAuthStore: () => mockUseAuthStore(),
+}));
+
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({
+    push: mockPush,
+  }),
 }));
 
 vi.mock('next/link', () => ({
@@ -20,6 +27,7 @@ vi.mock('next/link', () => ({
 describe('Home page', () => {
   beforeEach(() => {
     mockUseAuthStore.mockReset();
+    mockPush.mockReset();
   });
 
   afterEach(() => {
@@ -351,9 +359,9 @@ describe('Home page', () => {
           ok: true,
           status: 200,
           json: async () => ({
-            inProgress: true,
-            downloadedFileCount: 2,
-            completionPercent: 40,
+            inProgress: false,
+            downloadedFileCount: 0,
+            completionPercent: 0,
           }),
         });
       }

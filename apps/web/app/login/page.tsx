@@ -1,5 +1,6 @@
 'use client';
 
+import { Suspense } from 'react';
 import { useSearchParams } from 'next/navigation';
 import './login.css';
 
@@ -19,7 +20,7 @@ function getErrorMessage(error: string | null, message: string | null): string |
   return null;
 }
 
-export default function LoginPage() {
+function LoginPageContent() {
   const searchParams = useSearchParams();
   const redirectUri = typeof window === 'undefined'
     ? undefined
@@ -55,5 +56,13 @@ export default function LoginPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={null}>
+      <LoginPageContent />
+    </Suspense>
   );
 }

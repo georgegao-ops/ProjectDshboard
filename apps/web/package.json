@@ -12,20 +12,27 @@
   },
   "dependencies": {
     "@contractor/shared": "workspace:*",
+    "framer-motion": "^12.38.0",
     "next": "^14.2.0",
+    "pdfjs-dist": "4.4.168",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
-    "zustand": "^4.4.0",
-    "tailwindcss": "^3.4.0"
+    "react-markdown": "^10.1.0",
+    "react-pdf": "^9.1.1",
+    "remark-gfm": "^4.0.1",
+    "tailwindcss": "^3.4.0",
+    "zustand": "^4.4.0"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.3.0",
     "@testing-library/user-event": "^14.6.1",
-    "@vitejs/plugin-react": "^4.4.1",
     "@types/react": "^18.3.0",
+    "@vitejs/plugin-react": "^4.4.1",
+    "autoprefixer": "^10.5.0",
     "jsdom": "^26.1.0",
-    "vitest": "^3.2.4",
-    "typescript": "^5.4.0"
+    "postcss": "^8.5.10",
+    "typescript": "^5.4.0",
+    "vitest": "^3.2.4"
   }
 }

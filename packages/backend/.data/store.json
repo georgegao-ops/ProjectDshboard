@@ -1,0 +1,22 @@
+{
+  "users": [
+    {
+      "id": "88c10a96-d6a6-4cec-83bd-8fbf526c6bce",
+      "email": "e2e-1776128967@example.com",
+      "name": "E2E User",
+      "role": "worker",
+      "passwordHash": "ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f",
+      "createdAt": "2026-04-14T01:09:27.979Z"
+    },
+    {
+      "id": "1f89566d-13f2-43a9-a18e-4fec24729250",
+      "email": "e2e-1776129582467@example.com",
+      "name": "E2E User",
+      "role": "worker",
+      "passwordHash": "ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f",
+      "createdAt": "2026-04-14T01:19:42.511Z"
+    }
+  ],
+  "projects": [],
+  "tasks": []
+}

@@ -6,8 +6,27 @@
 export type UUID = string & { readonly __brand: "UUID" };
 
 export type UserRole = "super" | "admin" | "pm" | "member";
-export type DocumentCategory = "submittal" | "spec" | "drawing" | "rfi" | "photo" | "report";
+
+/** Full set of construction document categories */
+export type DocumentCategory =
+  | "drawing"
+  | "rfi"
+  | "submittal"
+  | "change_order"
+  | "contract"
+  | "schedule"
+  | "spec"
+  | "meeting_minutes"
+  | "permit"
+  | "invoice"
+  | "safety"
+  | "photo"
+  | "report"
+  | "correspondence"
+  | "unknown";
+
 export type IndexStatus = "pending" | "processing" | "indexed" | "failed";
+export type ProcessingMode = "full" | "reduced" | "metadata_only";
 
 /**
  * Organization — Multi-tenant container
@@ -66,8 +85,24 @@ export interface FileRecord {
   sheetNumber?: string; // e.g., 'A101'
   revision?: string; // e.g., 'Rev 3'
 
+  // Construction intelligence — structured extracted fields
+  extractedFields?: Record<string, string | undefined>;
+
+  // Priority score 0-100 (higher = indexed first)
+  priorityScore?: number;
+  processingMode?: ProcessingMode;
+  processingReason?: string;
+  reducedCoverage?: boolean;
+  extractedContentPercent?: number;
+  normalizedTextObjectKey?: string;
+  normalizedTextChecksum?: string;
+  normalizedTextLength?: number;
+  normalizedTextStoredAt?: Date;
+  encryptionKeyVersion?: number;
+
   // Sync metadata
   onedriveEtag?: string; // for change detection
+  versionHash?: string;
   lastSynced?: Date;
   indexStatus: IndexStatus;
   lastIndexed?: Date;
@@ -98,6 +133,16 @@ export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   sources?: ChatMessageSource[]; // [{file_id, file_name, chunk_id, relevance}]
+  interpretation?: {
+    intent: string;
+    confidence: number;
+    source: "rules" | "llm" | "fallback";
+  };
+  feedback?: {
+    verdict: "accepted" | "corrected" | "irrelevant";
+    correctedIntent?: string;
+    note?: string;
+  };
   createdAt: Date;
 }
 

@@ -11,7 +11,8 @@
     "db:studio": "drizzle-kit studio --config ./drizzle.config.ts",
     "test": "vitest run --config ./vitest.config.ts",
     "type-check": "tsc --noEmit",
-    "lint": "eslint src --ext .ts"
+    "lint": "eslint src --ext .ts",
+    "retrieval:eval": "tsx ./scripts/retrieval-eval.ts"
   },
   "dependencies": {
     "@contractor/shared": "workspace:*",
@@ -20,13 +21,16 @@
     "drizzle-orm": "^0.30.0",
     "express": "^4.18.0",
     "mammoth": "^1.12.0",
+    "papaparse": "^5.4.1",
     "pdf-parse": "^2.4.5",
     "postgres": "^3.4.0",
-    "redis": "^4.6.0"
+    "redis": "^4.6.0",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@types/express": "^4.17.0",
     "@types/node": "^20.10.0",
+    "@types/papaparse": "^5.3.14",
     "@types/supertest": "^6.0.3",
     "drizzle-kit": "^0.20.0",
     "supertest": "^7.1.4",

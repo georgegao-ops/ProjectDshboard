@@ -2,13 +2,33 @@
 
 import { useAuthStore } from '@contractor/shared';
 import Link from 'next/link';
-import { FormEvent, useCallback, useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import './page.css';
 
 interface HomeProject {
   id: string;
   name: string;
   onedriveFolderId?: string;
+}
+
+interface OneDriveBrowseItem {
+  id: string;
+  name: string;
+  isFolder: boolean;
+  webUrl: string;
+}
+
+interface OneDriveBrowseResponse {
+  items: OneDriveBrowseItem[];
+  parentId?: string;
+}
+
+interface UpdateProjectFolderResponse {
+  project: HomeProject;
+  resetPerformed: boolean;
+  sync: SyncResponse;
+  message: string;
 }
 
 interface OneDriveStatus {
@@ -58,11 +78,33 @@ interface SyncProgressResponse {
 
 interface IndexingProgressResponse {
   total: number;
+  processableTotal: number;
   pending: number;
   processing: number;
   indexed: number;
   failed: number;
+  skipped: number;
+  unsupportedCount: number;
+  oversizeCount: number;
   completionPercent: number;
+  paused: boolean;
+  pauseReasonCode?: string;
+  pauseMessage?: string;
+  pauseSince?: string;
+  pauseUntil?: string;
+  circuitOpen: boolean;
+  groupedFailureReasons?: Array<{
+    stage: string;
+    errorCode: string;
+    count: number;
+    lastMessage: string;
+    lastSeenAt: string;
+  }>;
+  anomalies?: Array<{
+    type: string;
+    count: number;
+    message: string;
+  }>;
 }
 
 interface ProjectChunkItem {
@@ -88,8 +130,24 @@ interface RetrievalPreviewResponse {
   sources: RetrievalSource[];
 }
 
+interface ChatSessionResponse {
+  session: {
+    id: string;
+  };
+}
+
+interface ChatSendResponse {
+  content: string;
+  sources?: RetrievalSource[];
+  coordinator?: {
+    domains?: string[];
+    splitSignals?: string[];
+  };
+}
+
 export default function Home() {
   const { isAuthenticated, user, hydrate, logout, isLoading, error } = useAuthStore();
+  const router = useRouter();
   const oneDriveMessageFromUrl =
     typeof window === 'undefined'
       ? null
@@ -113,6 +171,13 @@ export default function Home() {
   const [retrievalSources, setRetrievalSources] = useState<RetrievalSource[]>([]);
   const [isRetrievalLoading, setIsRetrievalLoading] = useState(false);
   const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
+  const [chatSessionId, setChatSessionId] = useState<string | null>(null);
+  const [chatPrompt, setChatPrompt] = useState('Summarize key risks from the latest synced files.');
+  const [chatAnswer, setChatAnswer] = useState<string | null>(null);
+  const [chatSources, setChatSources] = useState<RetrievalSource[]>([]);
+  const [chatRouteSummary, setChatRouteSummary] = useState<string | null>(null);
+  const [isChatLoading, setIsChatLoading] = useState(false);
+  const [chatError, setChatError] = useState<string | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const [lastSyncSummary, setLastSyncSummary] = useState<string | null>(null);
   const [syncStatusMessage, setSyncStatusMessage] = useState<string | null>(null);
@@ -120,6 +185,12 @@ export default function Home() {
   const [syncElapsedSeconds, setSyncElapsedSeconds] = useState(0);
   const [syncProgress, setSyncProgress] = useState<SyncProgressResponse | null>(null);
   const [isSyncProgressLoading, setIsSyncProgressLoading] = useState(false);
+  const [oneDriveFolders, setOneDriveFolders] = useState<OneDriveBrowseItem[]>([]);
+  const [isOneDriveFoldersLoading, setIsOneDriveFoldersLoading] = useState(false);
+  const [oneDriveFolderError, setOneDriveFolderError] = useState<string | null>(null);
+  const [selectedMainFolderId, setSelectedMainFolderId] = useState('');
+  const [isUpdatingMainFolder, setIsUpdatingMainFolder] = useState(false);
+  const lastProjectSelectionRef = useRef<string | undefined>(undefined);
 
   // Restore the last successful app session from persisted auth state.
   useEffect(() => {
@@ -291,6 +362,7 @@ export default function Home() {
 
       const data = (await response.json()) as SyncProgressResponse;
       setSyncProgress(data);
+      setIsSyncing(data.inProgress);
     } catch {
       // Sync progress is best-effort UI feedback and should not block the page.
     } finally {
@@ -348,8 +420,37 @@ export default function Home() {
     setProjectChunks([]);
     setRetrievalSources([]);
     setDiagnosticsError(null);
+    setChatSessionId(null);
+    setChatAnswer(null);
+    setChatSources([]);
+    setChatRouteSummary(null);
+    setChatError(null);
     setSyncProgress(null);
+    setSelectedMainFolderId('');
   }, [selectedProjectId, loadProjectFiles, loadIndexingProgress, loadSyncProgress]);
+
+  useEffect(() => {
+    if (!selectedProjectId) {
+      lastProjectSelectionRef.current = undefined;
+      setSelectedMainFolderId('');
+      return;
+    }
+
+    // Only initialize folder selection when the selected project changes.
+    if (lastProjectSelectionRef.current !== selectedProjectId) {
+      const selectedProject = projects.find((project) => project.id === selectedProjectId);
+      setSelectedMainFolderId(selectedProject?.onedriveFolderId ?? '');
+      lastProjectSelectionRef.current = selectedProjectId;
+    }
+  }, [selectedProjectId, projects]);
+
+  useEffect(() => {
+    setChatSessionId(null);
+    setChatAnswer(null);
+    setChatSources([]);
+    setChatRouteSummary(null);
+    setChatError(null);
+  }, [selectedProjectId]);
 
   useEffect(() => {
     if (!isSyncing) {
@@ -376,15 +477,22 @@ export default function Home() {
       void loadOnboardingData();
       void loadProjectFiles(selectedProjectId);
       void loadIndexingProgress(selectedProjectId);
-      if (isSyncing) {
-        void loadSyncProgress(selectedProjectId);
-      }
+      void loadSyncProgress(selectedProjectId);
     }, 1000);
 
     return () => {
       window.clearInterval(pollId);
     };
-  }, [selectedProjectId, isSyncing, loadOnboardingData, loadProjectFiles, loadIndexingProgress, loadSyncProgress]);
+  }, [selectedProjectId, loadOnboardingData, loadProjectFiles, loadIndexingProgress, loadSyncProgress]);
+
+  useEffect(() => {
+    const query = selectedProjectId
+      ? `?projectId=${encodeURIComponent(selectedProjectId)}`
+      : '';
+
+    // Warm the chat route bundle/data to reduce delay after clicking AI Chat.
+    router.prefetch(`/workspace/chat${query}`);
+  }, [router, selectedProjectId]);
 
   const handleOpenOneDrive = () => {
     const activeProjectFolderId = projects.find((project) => project.id === selectedProjectId)?.onedriveFolderId;
@@ -398,6 +506,134 @@ export default function Home() {
   const handleStartOneDriveConnect = () => {
     const redirectUri = `${window.location.origin}/onedrive/callback`;
     window.location.href = `/api/onedrive/connect?redirectUri=${encodeURIComponent(redirectUri)}`;
+  };
+
+  const handleOpenAiChat = () => {
+    const query = selectedProjectId
+      ? `?projectId=${encodeURIComponent(selectedProjectId)}`
+      : '';
+    router.push(`/workspace/chat${query}`);
+  };
+
+  const loadOneDriveFolders = useCallback(async () => {
+    if (!oneDriveStatus?.connected) {
+      setOneDriveFolderError('Connect OneDrive first to browse folders.');
+      return;
+    }
+
+    setIsOneDriveFoldersLoading(true);
+    setOneDriveFolderError(null);
+
+    try {
+      const response = await fetch('/api/onedrive/browse', { method: 'GET' });
+      if (!response.ok) {
+        throw new Error('Unable to load OneDrive folders.');
+      }
+
+      const payload = (await response.json()) as OneDriveBrowseResponse;
+      const folders = (payload.items ?? []).filter((item) => item.isFolder);
+      setOneDriveFolders(folders);
+
+      const selectedProject = projects.find((project) => project.id === selectedProjectId);
+      if (selectedProject?.onedriveFolderId) {
+        setSelectedMainFolderId(selectedProject.onedriveFolderId);
+      } else if (folders[0]?.id) {
+        setSelectedMainFolderId(folders[0].id);
+      }
+    } catch (browseError) {
+      setOneDriveFolderError(
+        browseError instanceof Error ? browseError.message : 'Unable to load OneDrive folders.'
+      );
+    } finally {
+      setIsOneDriveFoldersLoading(false);
+    }
+  }, [oneDriveStatus?.connected, projects, selectedProjectId]);
+
+  const ensureChatSession = useCallback(async (projectId: string): Promise<string> => {
+    if (chatSessionId) {
+      return chatSessionId;
+    }
+
+    const response = await fetch('/api/chat/sessions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ projectId }),
+    });
+
+    if (!response.ok) {
+      throw new Error('Unable to create chat session for this project.');
+    }
+
+    const payload = (await response.json()) as ChatSessionResponse;
+    const nextSessionId = payload.session?.id;
+    if (!nextSessionId) {
+      throw new Error('Chat session creation returned an invalid response.');
+    }
+
+    setChatSessionId(nextSessionId);
+    return nextSessionId;
+  }, [chatSessionId]);
+
+  const handleRunAiChat = async (event?: FormEvent<HTMLFormElement>) => {
+    event?.preventDefault();
+
+    const projectId = selectedProjectId;
+    const prompt = chatPrompt.trim();
+
+    if (!projectId) {
+      setChatError('Select a project before sending an AI chat message.');
+      return;
+    }
+
+    if (!prompt) {
+      setChatError('Enter a message before sending.');
+      return;
+    }
+
+    setIsChatLoading(true);
+    setChatError(null);
+
+    try {
+      const sessionId = await ensureChatSession(projectId);
+      const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/message`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          sessionId,
+          message: prompt,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorPayload = await response.json().catch(() => undefined) as
+          | { message?: string }
+          | undefined;
+        throw new Error(errorPayload?.message ?? 'AI chat request failed.');
+      }
+
+      const payload = (await response.json()) as ChatSendResponse;
+      setChatAnswer(payload.content ?? 'No response content returned.');
+      setChatSources(payload.sources ?? []);
+
+      const domainSummary = payload.coordinator?.domains?.length
+        ? `Domains: ${payload.coordinator.domains.join(', ')}`
+        : null;
+      const splitSummary = payload.coordinator?.splitSignals?.length
+        ? `Split signals: ${payload.coordinator.splitSignals.join(', ')}`
+        : null;
+
+      setChatRouteSummary([domainSummary, splitSummary].filter(Boolean).join(' | ') || null);
+    } catch (requestError) {
+      setChatError(
+        requestError instanceof Error ? requestError.message : 'AI chat request failed.'
+      );
+    } finally {
+      setIsChatLoading(false);
+    }
   };
 
   const handleCreateProject = async (event: FormEvent<HTMLFormElement>) => {
@@ -496,6 +732,91 @@ export default function Home() {
     }
   };
 
+  const handleApplyMainProjectFolder = useCallback(async () => {
+    if (!selectedProjectId) {
+      setOneDriveFolderError('Select a project first.');
+      return;
+    }
+
+    const nextFolderId = selectedMainFolderId.trim();
+    if (!nextFolderId) {
+      setOneDriveFolderError('Select a OneDrive folder before applying.');
+      return;
+    }
+
+    setIsUpdatingMainFolder(true);
+    setOneDriveFolderError(null);
+    setOnboardingError(null);
+    setProjectFiles([]);
+    setProjectFilesTotal(0);
+    setProjectChunks([]);
+    setRetrievalSources([]);
+    setDiagnosticsError(null);
+    setChatAnswer(null);
+    setChatSources([]);
+    setChatRouteSummary(null);
+    setSyncProgress(null);
+    setSyncStatusMessage('Updating project folder, clearing old index, and starting a fresh sync...');
+    setIsSyncing(true);
+
+    try {
+      const response = await fetch(`/api/projects/${encodeURIComponent(selectedProjectId)}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          onedriveFolderId: nextFolderId,
+          resetIndexedData: true,
+        }),
+      });
+
+      const payload = (await response.json().catch(() => undefined)) as
+        | UpdateProjectFolderResponse
+        | { message?: string; error?: string }
+        | undefined;
+
+      if (!response.ok) {
+        const payloadMessage = payload && 'message' in payload ? payload.message : undefined;
+        const payloadError = payload && 'error' in payload ? payload.error : undefined;
+        const fallback = response.statusText
+          ? `Unable to update project folder (${response.status}: ${response.statusText}).`
+          : `Unable to update project folder (${response.status}).`;
+        throw new Error(payloadMessage || payloadError || fallback);
+      }
+
+      setLastSyncSummary(
+        payload && 'sync' in payload && payload.sync?.message
+          ? payload.sync.message
+          : payload && 'message' in payload && payload.message
+            ? payload.message
+            : 'Project folder updated.'
+      );
+      setSyncStatusMessage(
+        payload && 'sync' in payload && payload.sync?.syncStarted
+          ? 'Fresh sync started for selected main folder.'
+          : 'Project folder updated. Sync did not start because there were no supported files.'
+      );
+
+      // Do not block the Apply button on potentially heavy refresh calls.
+      // Refresh data in the background so the user can continue interacting immediately.
+      void Promise.allSettled([
+        loadOnboardingData(),
+        loadProjectFiles(selectedProjectId),
+        loadIndexingProgress(selectedProjectId),
+        loadSyncProgress(selectedProjectId),
+      ]);
+    } catch (updateError) {
+      const message = updateError instanceof Error ? updateError.message : 'Unable to update project folder.';
+      setOneDriveFolderError(message);
+      setOnboardingError(message);
+      setSyncStatusMessage(null);
+      setIsSyncing(false);
+    } finally {
+      setIsUpdatingMainFolder(false);
+    }
+  }, [loadIndexingProgress, loadOnboardingData, loadProjectFiles, loadSyncProgress, selectedMainFolderId, selectedProjectId]);
+
   const handleSelectProject = (projectId: string) => {
     const isNewSelection = selectedProjectId !== projectId;
     setSelectedProjectId(projectId);
@@ -574,10 +895,10 @@ export default function Home() {
                   <span className="feature-label">OneDrive</span>
                   <span className="feature-sub">Open folder website</span>
                 </button>
-                <button type="button" className="feature-tile feature-tile-live" disabled>
+                <button type="button" className="feature-tile feature-tile-live" onClick={handleOpenAiChat}>
                   <span className="feature-icon">AI</span>
                   <span className="feature-label">AI Chat</span>
-                  <span className="feature-sub">Answer from selected folder</span>
+                  <span className="feature-sub">Test routed agent on selected project</span>
                 </button>
                 <button type="button" className="feature-tile feature-tile-soon" disabled>
                   <span className="feature-icon">PH</span>
@@ -611,6 +932,44 @@ export default function Home() {
                   ))}
                 </ul>
               )}
+
+              <div className="folder-dropdown-panel">
+                <h4>Main Project Folder</h4>
+                <p className="phase2-note">
+                  Change the OneDrive folder used for this project. Existing indexed data will be cleared before re-indexing.
+                </p>
+                <div className="folder-dropdown-actions">
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    onClick={() => void loadOneDriveFolders()}
+                    disabled={!oneDriveStatus?.connected || isOneDriveFoldersLoading}
+                  >
+                    {isOneDriveFoldersLoading ? 'Loading folders...' : 'Load OneDrive Folders'}
+                  </button>
+                  <select
+                    value={selectedMainFolderId}
+                    onChange={(event) => setSelectedMainFolderId(event.target.value)}
+                    disabled={oneDriveFolders.length === 0 || isUpdatingMainFolder}
+                  >
+                    <option value="">Select OneDrive folder...</option>
+                    {oneDriveFolders.map((folder) => (
+                      <option key={folder.id} value={folder.id}>
+                        {folder.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={() => void handleApplyMainProjectFolder()}
+                  disabled={!selectedProjectId || !selectedMainFolderId || isUpdatingMainFolder}
+                >
+                  {isUpdatingMainFolder ? 'Applying...' : 'Set As Main Folder And Re-index'}
+                </button>
+                {oneDriveFolderError ? <p className="page-error">{oneDriveFolderError}</p> : null}
+              </div>
             </div>
 
             <div className="phase2-card">
@@ -697,9 +1056,24 @@ export default function Home() {
               {isIndexingProgressLoading ? (
                 <p className="phase2-note">Updating indexing progress...</p>
               ) : indexingProgress ? (
-                <p className="phase2-note">
-                  Indexed {indexingProgress.indexed}, processing {indexingProgress.processing}, pending {indexingProgress.pending}, failed {indexingProgress.failed}.
-                </p>
+                <>
+                  <p className="phase2-note">
+                    Indexed {indexingProgress.indexed}, processing {indexingProgress.processing}, pending {indexingProgress.pending}, skipped {indexingProgress.skipped}, failed {indexingProgress.failed}.
+                  </p>
+                  <p className="phase2-note">
+                    Processable files: {indexingProgress.processableTotal} of {indexingProgress.total} inventory files.
+                  </p>
+                  {indexingProgress.paused ? (
+                    <p className="page-error sync-error">
+                      Indexing paused{indexingProgress.pauseReasonCode ? ` [${indexingProgress.pauseReasonCode}]` : ''}: {indexingProgress.pauseMessage ?? 'Unknown pause reason.'}
+                    </p>
+                  ) : null}
+                  {indexingProgress.circuitOpen ? (
+                    <p className="phase2-note">
+                      Circuit breaker is open. Remaining files stay pending until provider recovery.
+                    </p>
+                  ) : null}
+                </>
               ) : null}
               <p className="status-row">
                 Inventory count: <strong>{projectFilesTotal}</strong>
@@ -712,15 +1086,17 @@ export default function Home() {
               ) : (
                 <ul className="inventory-list">
                   {projectFiles.map((file) => {
-                    const unsupported = (file.tags ?? []).includes('unsupported_type') || (file.tags ?? []).includes('oversize');
+                    const isUnsupportedType = (file.tags ?? []).includes('unsupported_type');
+                    const isOversize = (file.tags ?? []).includes('oversize');
+                    const skippedReason = isOversize ? 'Skipped: oversize' : isUnsupportedType ? 'Skipped: unsupported' : null;
 
                     return (
                       <li key={file.id} className="inventory-item">
                         <p className="inventory-name">{file.fileName}</p>
                         <p className="inventory-meta">{file.filePath}</p>
                         <p className="inventory-meta">
-                          Status: <strong>{file.indexStatus}</strong>
-                          {unsupported ? <span className="inventory-unsupported">Unsupported</span> : null}
+                          Status: <strong>{skippedReason ? 'skipped' : file.indexStatus}</strong>
+                          {skippedReason ? <span className="inventory-unsupported">{skippedReason}</span> : null}
                         </p>
                       </li>
                     );
@@ -746,6 +1122,33 @@ export default function Home() {
                 <p className="status-row">
                   Chunk count: <strong>{projectChunks.length}</strong>
                 </p>
+                {indexingProgress?.anomalies && indexingProgress.anomalies.length > 0 ? (
+                  <ul className="diagnostics-list">
+                    {indexingProgress.anomalies.map((anomaly) => (
+                      <li key={anomaly.type} className="diagnostics-item">
+                        <p>
+                          <strong>{anomaly.type}</strong> ({anomaly.count})
+                        </p>
+                        <p className="inventory-meta">{anomaly.message}</p>
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+                {indexingProgress?.groupedFailureReasons && indexingProgress.groupedFailureReasons.length > 0 ? (
+                  <>
+                    <p className="phase2-note">Top failure reasons</p>
+                    <ul className="diagnostics-list">
+                      {indexingProgress.groupedFailureReasons.map((reason) => (
+                        <li key={`${reason.stage}:${reason.errorCode}`} className="diagnostics-item">
+                          <p>
+                            <strong>{reason.stage}</strong> / {reason.errorCode} ({reason.count})
+                          </p>
+                          <p className="inventory-meta">{reason.lastMessage}</p>
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                ) : null}
                 {projectChunks.length > 0 ? (
                   <ul className="diagnostics-list">
                     {projectChunks.slice(0, 5).map((chunk) => (
@@ -797,6 +1200,46 @@ export default function Home() {
                   </ul>
                 ) : null}
                 {diagnosticsError ? <p className="page-error sync-error">{diagnosticsError}</p> : null}
+              </div>
+
+              <div className="diagnostics-panel ai-chat-panel" id="ai-chat-tester">
+                <h4>AI Chat Tester</h4>
+                <p className="phase2-note">
+                  Send a question to the Phase 4.5c coordinator agent for the selected project.
+                </p>
+                <form className="project-form diagnostics-form" onSubmit={(event) => void handleRunAiChat(event)}>
+                  <label htmlFor="chat-prompt">Question</label>
+                  <textarea
+                    id="chat-prompt"
+                    className="chat-textarea"
+                    value={chatPrompt}
+                    onChange={(event) => setChatPrompt(event.target.value)}
+                    placeholder="What are schedule and cost risks we should notify the owner about this week?"
+                  />
+                  <button
+                    type="submit"
+                    className="btn btn-primary"
+                    disabled={!selectedProjectId || isChatLoading}
+                  >
+                    {isChatLoading ? 'Sending...' : 'Send To AI Chat'}
+                  </button>
+                </form>
+
+                {chatRouteSummary ? <p className="phase2-note">{chatRouteSummary}</p> : null}
+                {chatAnswer ? <p className="chat-answer">{chatAnswer}</p> : null}
+                {chatSources.length > 0 ? (
+                  <ul className="diagnostics-list">
+                    {chatSources.map((source) => (
+                      <li key={source.fileId} className="diagnostics-item">
+                        <p>
+                          <strong>{source.fileName}</strong>
+                        </p>
+                        <p className="inventory-meta">Relevance: {Math.round(source.relevance * 100)}%</p>
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+                {chatError ? <p className="page-error sync-error">{chatError}</p> : null}
               </div>
             </div>
           </div>
